@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -222,6 +222,25 @@ pub fn one_line(text: &str, max: usize) -> String {
     out
 }
 
+/// `<projects>/<slug>/<sid>.jsonl`. A worktree cwd encodes to another slug than the session
+/// started in, so after the cwd's own slug every project dir is tried.
+pub fn locate(projects: &Path, sid: &str, cwd: &str) -> Option<PathBuf> {
+    let file = format!("{sid}.jsonl");
+    let slug: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let guess = projects.join(slug).join(&file);
+    if guess.is_file() {
+        return Some(guess);
+    }
+    std::fs::read_dir(projects)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
+}
+
 /// Seconds since the epoch for an RFC 3339 UTC time like `2026-10-28T10:50:15.350Z`.
 pub fn parse_timestamp(s: &str) -> Option<i64> {
     let b = s.as_bytes();
@@ -440,6 +459,26 @@ mod tests {
         t.read(&path).unwrap();
         assert_eq!(t.activity.current().unwrap().name, "R");
         assert_eq!(t.activity.recent.len(), 1);
+    }
+
+    #[test]
+    fn locate_tries_the_cwd_slug_then_every_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("-work-my-repo");
+        let other = dir.path().join("-work-my-repo--claude-worktrees-w-3");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(own.join("s1.jsonl"), "").unwrap();
+        std::fs::write(other.join("s2.jsonl"), "").unwrap();
+        assert_eq!(
+            locate(dir.path(), "s1", "/work/my_repo"),
+            Some(own.join("s1.jsonl"))
+        );
+        assert_eq!(
+            locate(dir.path(), "s2", "/work/my_repo"),
+            Some(other.join("s2.jsonl"))
+        );
+        assert_eq!(locate(dir.path(), "s3", "/work/my_repo"), None);
     }
 
     #[test]
