@@ -82,11 +82,14 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
     let mut dirty = true;
     let mut urgent = true;
     let mut last_draw = Instant::now();
-    let mut ticks = Deadline::new(Instant::now());
+    let mut ticks = Deadline::new();
     loop {
         let now = Instant::now();
         if ticks.due(now, app.tick_interval()) {
             app.tick();
+            // From the end of the tick, so one slowed by a hung herdr call is not followed
+            // straight away by the next.
+            ticks.fired(Instant::now());
             dirty = true;
         }
         if dirty && (urgent || now.duration_since(last_draw) >= DEBOUNCE) {
@@ -95,7 +98,10 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             dirty = false;
             urgent = false;
         }
-        let mut wait = ticks.left(Instant::now());
+        let now = Instant::now();
+        let mut wait = ticks
+            .next(app.tick_interval(), now)
+            .saturating_duration_since(now);
         if dirty {
             wait = wait.min(DEBOUNCE.saturating_sub(last_draw.elapsed()));
         }
@@ -118,28 +124,28 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
     }
 }
 
-/// A tick deadline that messages arriving in between do not push back.
-#[derive(Debug)]
+/// A tick deadline that messages arriving in between do not push back. It keeps when it
+/// last fired rather than when it fires next, so a shorter interval takes effect at once.
+#[derive(Debug, Default)]
 struct Deadline {
-    next: Instant,
+    last: Option<Instant>,
 }
 
 impl Deadline {
-    fn new(now: Instant) -> Self {
-        Deadline { next: now }
+    fn new() -> Self {
+        Deadline::default()
     }
 
-    /// `true` once the deadline passed, and the next one is then `interval` away.
-    fn due(&mut self, now: Instant, interval: Duration) -> bool {
-        if now < self.next {
-            return false;
-        }
-        self.next = now + interval;
-        true
+    fn next(&self, interval: Duration, now: Instant) -> Instant {
+        self.last.map_or(now, |last| last + interval)
     }
 
-    fn left(&self, now: Instant) -> Duration {
-        self.next.saturating_duration_since(now)
+    fn due(&self, now: Instant, interval: Duration) -> bool {
+        now >= self.next(interval, now)
+    }
+
+    fn fired(&mut self, at: Instant) {
+        self.last = Some(at);
     }
 }
 
@@ -147,17 +153,47 @@ impl Deadline {
 mod tests {
     use super::*;
 
+    fn fire(d: &mut Deadline, now: Instant, interval: Duration) -> bool {
+        let due = d.due(now, interval);
+        if due {
+            d.fired(now);
+        }
+        due
+    }
+
     #[test]
     fn steady_messages_do_not_postpone_the_tick() {
         let start = Instant::now();
         let second = Duration::from_secs(1);
-        let mut d = Deadline::new(start);
-        assert!(d.due(start, second));
+        let mut d = Deadline::new();
+        assert!(fire(&mut d, start, second));
         let fired: Vec<bool> = (1..=12)
-            .map(|i| d.due(start + Duration::from_millis(100 * i), second))
+            .map(|i| fire(&mut d, start + Duration::from_millis(100 * i), second))
             .collect();
         assert_eq!(fired.iter().filter(|f| **f).count(), 1);
         assert!(fired[9]);
-        assert_eq!(d.left(start + second), second);
+        assert_eq!(d.next(second, start), start + 2 * second);
+    }
+
+    #[test]
+    fn a_shrinking_interval_fires_within_the_new_one() {
+        let start = Instant::now();
+        let mut d = Deadline::new();
+        assert!(fire(&mut d, start, Duration::from_secs(30)));
+        let second = Duration::from_secs(1);
+        assert!(!d.due(start + Duration::from_millis(500), second));
+        assert!(d.due(start + second, second));
+    }
+
+    #[test]
+    fn a_slow_tick_still_leaves_a_full_interval() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut d = Deadline::new();
+        assert!(d.due(start, second));
+        let finished = start + 2 * second;
+        d.fired(finished);
+        assert!(!d.due(finished + Duration::from_millis(500), second));
+        assert_eq!(d.next(second, finished), finished + second);
     }
 }
