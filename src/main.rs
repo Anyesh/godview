@@ -1,4 +1,5 @@
 mod children;
+mod crew;
 mod feed;
 mod herdr;
 mod log;
