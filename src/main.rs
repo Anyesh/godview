@@ -23,6 +23,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::widgets::ListState;
 
+use crate::anim::FRAME;
 use crate::app::{App, Effect, Msg};
 use crate::herdr::Client;
 use crate::watch::Watches;
@@ -77,14 +78,17 @@ fn run(client: Client) -> Result<()> {
     result
 }
 
-/// Draws at most once per [`DEBOUNCE`] for file and herdr changes and at once for keys, and
-/// otherwise sleeps until the next message or tick.
+/// Draws at most once per [`DEBOUNCE`] for file and herdr changes, at once for keys and
+/// frames, and otherwise sleeps until the next message, tick or frame. Frames run only while
+/// something on screen moves.
 fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) -> Result<()> {
     let mut list = ListState::default();
     let mut dirty = true;
     let mut urgent = true;
     let mut last_draw = Instant::now();
     let mut ticks = Deadline::new();
+    let mut frames = Deadline::new();
+    let mut was_animating = false;
     loop {
         let now = Instant::now();
         if ticks.due(now, app.tick_interval()) {
@@ -94,6 +98,18 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             ticks.fired(Instant::now());
             dirty = true;
         }
+        let animating = app.animating(now);
+        if animating && frames.due(now, FRAME) {
+            app.advance_frame();
+            frames.fired(now);
+            dirty = true;
+            urgent = true;
+        } else if was_animating && !animating {
+            // The frame that clears the last flash or stops the spinners.
+            dirty = true;
+            urgent = true;
+        }
+        was_animating = animating;
         if dirty && (urgent || now.duration_since(last_draw) >= DEBOUNCE) {
             terminal.draw(|f| ui::draw(f, &app.view(), &mut list))?;
             last_draw = Instant::now();
@@ -101,12 +117,14 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             urgent = false;
         }
         let now = Instant::now();
-        let mut wait = ticks
-            .next(app.tick_interval(), now)
-            .saturating_duration_since(now);
-        if dirty {
-            wait = wait.min(DEBOUNCE.saturating_sub(last_draw.elapsed()));
-        }
+        let wait = next_wait(
+            now,
+            ticks.next(app.tick_interval(), now),
+            frames.next(FRAME, now),
+            animating,
+            dirty,
+            last_draw,
+        );
         let first = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -124,6 +142,26 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             }
         }
     }
+}
+
+/// How long to sleep before the next tick, frame or debounced draw. A frame deadline counts
+/// only while animating, so one left in the past by an idle spell cannot spin the loop.
+fn next_wait(
+    now: Instant,
+    tick_at: Instant,
+    frame_at: Instant,
+    animating: bool,
+    dirty: bool,
+    last_draw: Instant,
+) -> Duration {
+    let mut at = tick_at;
+    if animating {
+        at = at.min(frame_at);
+    }
+    if dirty {
+        at = at.min(last_draw + DEBOUNCE);
+    }
+    at.saturating_duration_since(now)
 }
 
 /// A tick deadline that messages arriving in between do not push back. It keeps when it
@@ -175,6 +213,43 @@ mod tests {
         assert_eq!(fired.iter().filter(|f| **f).count(), 1);
         assert!(fired[9]);
         assert_eq!(d.next(second, start), start + 2 * second);
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_wait_ignores_a_stale_frame_deadline_when_nothing_animates() {
+        let now = Instant::now() + ms(10_000);
+        let wait = next_wait(now, now + ms(1000), now - ms(5000), false, false, now);
+        assert_eq!(wait, ms(1000));
+    }
+
+    #[test]
+    fn the_wait_is_zero_only_when_something_is_due() {
+        let now = Instant::now() + ms(10_000);
+        assert_eq!(next_wait(now, now, now + ms(50), true, false, now), ms(0));
+        assert_eq!(next_wait(now, now + ms(1000), now, true, false, now), ms(0));
+        let drew = now - ms(30);
+        assert_eq!(
+            next_wait(now, now + ms(1000), now - ms(500), false, true, drew),
+            ms(70)
+        );
+        assert_eq!(
+            next_wait(now, now + ms(1000), now + ms(50), false, false, drew),
+            ms(1000)
+        );
+    }
+
+    #[test]
+    fn the_wait_caps_at_the_next_frame_while_animating() {
+        let now = Instant::now() + ms(10_000);
+        let mut frames = Deadline::new();
+        frames.fired(now - ms(25));
+        let frame_at = frames.next(FRAME, now);
+        let wait = next_wait(now, now + ms(30_000), frame_at, true, false, now);
+        assert_eq!(wait, FRAME - ms(25));
     }
 
     #[test]
