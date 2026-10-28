@@ -136,11 +136,14 @@ fn footer_line(view: &View, width: usize) -> Line<'static> {
     justify(vec![keys], status.into_iter().collect(), width)
 }
 
+/// `right` against the right edge, or left out when it would run into `left`.
 fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let used: usize = left.iter().chain(&right).map(Span::width).sum();
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    spans.extend(right);
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+        spans.extend(right);
+    }
     Line::from(spans)
 }
 
@@ -830,7 +833,10 @@ mod tests {
             top.contains("1 agent · 1 working · 1 subagent running"),
             "{top}"
         );
-        assert!(header.contains("w working only"));
+        assert!(header.contains("m motion · w working only"));
+        let narrow = screen(&draw_on(60, 5, &view(&m)));
+        let top = narrow.lines().next().unwrap();
+        assert!(top.trim_end().ends_with("running"), "{top}");
         m.set_working_only(true);
         let s = render(&m, None);
         assert!(!s.contains("integrator"));
