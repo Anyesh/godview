@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT: &str = "default";
 
-/// Profile names per pane, read from `CLAUDE_PROFILE` in the environ of the pane's foreground
-/// process group leader and cached until that process is gone.
+/// Profile names per pane, read from the environ of the pane's foreground process group
+/// leader and cached until that process is gone.
 #[derive(Debug)]
 pub struct Profiles {
     proc_root: PathBuf,
@@ -41,14 +41,27 @@ impl Profiles {
     }
 }
 
+/// `CLAUDE_PROFILE`, else the `<name>` of a `CLAUDE_CONFIG_DIR` ending in `.claude-<name>`,
+/// which is all a crew worker's launch sets.
 fn read_profile(proc_root: &Path, pid: u32) -> Option<String> {
     let environ = fs::read(proc_root.join(pid.to_string()).join("environ")).ok()?;
-    let profile = environ
-        .split(|&b| b == 0)
-        .find_map(|kv| kv.strip_prefix(b"CLAUDE_PROFILE="))
-        .filter(|v| !v.is_empty())
-        .map_or(DEFAULT.into(), |v| String::from_utf8_lossy(v).into_owned());
-    Some(profile)
+    let var = |name: &[u8]| {
+        environ
+            .split(|&b| b == 0)
+            .find_map(|kv| kv.strip_prefix(name))
+            .filter(|v| !v.is_empty())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    };
+    let from_dir = || {
+        let dir = var(b"CLAUDE_CONFIG_DIR=")?;
+        let base = Path::new(&dir).file_name()?.to_str()?.to_string();
+        base.strip_prefix(".claude-").map(String::from)
+    };
+    Some(
+        var(b"CLAUDE_PROFILE=")
+            .or_else(from_dir)
+            .unwrap_or_else(|| DEFAULT.into()),
+    )
 }
 
 #[cfg(test)]
@@ -73,6 +86,25 @@ mod tests {
         proc_with(dir.path(), 42, &["HOME=/h", "CLAUDE_PROFILE=alpha", "X=1"]);
         let mut p = Profiles::new(dir.path());
         assert_eq!(p.get("w:p1", || Some(42)), Some("alpha"));
+    }
+
+    #[test]
+    fn falls_back_to_the_config_dir_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_with(dir.path(), 5, &["CLAUDE_CONFIG_DIR=/h/.claude-delta"]);
+        proc_with(dir.path(), 6, &["CLAUDE_CONFIG_DIR=/h/.claude"]);
+        proc_with(
+            dir.path(),
+            8,
+            &[
+                "CLAUDE_CONFIG_DIR=/h/.claude-delta/",
+                "CLAUDE_PROFILE=alpha",
+            ],
+        );
+        let mut p = Profiles::new(dir.path());
+        assert_eq!(p.get("a", || Some(5)), Some("delta"));
+        assert_eq!(p.get("b", || Some(6)), Some(DEFAULT));
+        assert_eq!(p.get("c", || Some(8)), Some("alpha"));
     }
 
     #[test]
