@@ -7,19 +7,30 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::anim::{FLASH, flow, pulse, sparkline, spinner};
 use crate::children::Liveness;
 use crate::herdr::Status;
 use crate::live::StreamItem;
-use crate::model::{AgentEntry, ChildEntry, ChildInfo, Model, Row};
-use crate::transcript::Activity;
+use crate::model::{AgentEntry, ChildEntry, ChildInfo, Model, NodeId, Row};
+use crate::transcript::{Activity, RATE_BUCKETS};
 
 const NAME_W: usize = 12;
 const PROFILE_W: usize = 8;
 const TYPE_W: usize = 15;
 const TOOL_W: usize = 8;
+const WHO_W: usize = 26;
 /// Where an agent's title starts: indent, glyph, name, profile and context columns.
 const TITLE_COL: usize = 2 + 2 + NAME_W + 1 + PROFILE_W + 1 + 4 + 2;
+const SPARK_COLS: usize = RATE_BUCKETS + 2;
 const SPLIT_MIN_WIDTH: u16 = 80;
+const SPARK_MIN_WIDTH: u16 = 100;
+const STREAM_ROWS: u16 = 7;
+const STREAM_MIN_HEIGHT: u16 = 30;
+const WIRE: Color = Color::Indexed(30);
+const PULSE: Color = Color::Indexed(51);
+const FLASH_BG: Color = Color::Indexed(23);
+const SELECTED_BG: Color = Color::Indexed(236);
+const SPARK: Color = Color::Indexed(73);
 
 pub struct View<'a> {
     pub model: &'a Model,
@@ -34,22 +45,48 @@ pub struct View<'a> {
     pub stream: &'a [StreamItem],
 }
 
+impl View<'_> {
+    /// The frame to draw motion at, `None` when motion is off.
+    fn motion_frame(&self) -> Option<u64> {
+        self.motion.then_some(self.frame)
+    }
+
+    fn flashing(&self, since: Option<Instant>) -> bool {
+        since.is_some_and(|t| self.instant < t + FLASH)
+    }
+}
+
+type Rows<'a> = [(NodeId, Row<'a>)];
+
 pub fn draw(frame: &mut Frame, view: &View, list: &mut ListState) {
-    let [header, body, footer] = Layout::vertical([
+    let area = frame.area();
+    let stream_rows = if area.height >= STREAM_MIN_HEIGHT {
+        STREAM_ROWS
+    } else {
+        0
+    };
+    let [header, body, stream, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(stream_rows),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
     frame.render_widget(header_line(view, header.width as usize), header);
+    let rows = view.model.rows();
+    let selected = view.model.selected_index_in(&rows);
+    let selection = selected.and_then(|i| rows.get(i)?.1.selection());
     if body.width >= SPLIT_MIN_WIDTH {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
                 .areas(body);
-        draw_tree(frame, view, left, list);
-        draw_detail(frame, view, right);
+        draw_tree(frame, view, &rows, selected, left, list);
+        draw_detail(frame, view, selection, right);
     } else {
-        draw_tree(frame, view, body, list);
+        draw_tree(frame, view, &rows, selected, body, list);
+    }
+    if stream_rows > 0 {
+        draw_stream(frame, view, stream);
     }
     frame.render_widget(footer_line(view, footer.width as usize), footer);
 }
@@ -76,9 +113,12 @@ fn header_line(view: &View, width: usize) -> Line<'static> {
         };
         Span::styled(text, style)
     };
+    let sep = || Span::styled(" · ", Style::new().fg(Color::DarkGray));
     let right = vec![
+        toggle(view.motion, "m motion"),
+        sep(),
         toggle(view.model.working_only(), "w working only"),
-        Span::styled(" · ", Style::new().fg(Color::DarkGray)),
+        sep(),
         toggle(view.model.all_children, "a all"),
         Span::raw(" "),
     ];
@@ -87,7 +127,7 @@ fn header_line(view: &View, width: usize) -> Line<'static> {
 
 fn footer_line(view: &View, width: usize) -> Line<'static> {
     let keys = Span::styled(
-        " j/k move · enter go to pane · p peek output · space fold/expand · q quit",
+        " j/k move · enter go to pane · p peek · space fold · m motion · q quit",
         Style::new().fg(Color::DarkGray),
     );
     let status = view
@@ -104,9 +144,15 @@ fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) ->
     Line::from(spans)
 }
 
-fn draw_tree(frame: &mut Frame, view: &View, area: Rect, list: &mut ListState) {
+fn draw_tree(
+    frame: &mut Frame,
+    view: &View,
+    rows: &Rows,
+    selected: Option<usize>,
+    area: Rect,
+    list: &mut ListState,
+) {
     let block = Block::bordered().title(" agents ");
-    let rows = view.model.rows();
     if rows.is_empty() {
         let text = if view.status.is_some() {
             "waiting for herdr"
@@ -118,20 +164,30 @@ fn draw_tree(frame: &mut Frame, view: &View, area: Rect, list: &mut ListState) {
     }
     // The highlight symbol column takes two cells of every row.
     let width = (area.width as usize).saturating_sub(4);
+    let spark = area.width >= SPARK_MIN_WIDTH;
+    // The selection background goes under the text rather than over it, as List's highlight
+    // style would, so a flashing line on the selected row keeps its own background.
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|(_, row)| ListItem::new(row_text(row, width, view)))
+        .enumerate()
+        .map(|(i, (_, row))| {
+            let text = row_text(row, width, view, spark);
+            ListItem::new(if Some(i) == selected {
+                text.patch_style(Style::new().bg(SELECTED_BG))
+            } else {
+                text
+            })
+        })
         .collect();
-    list.select(view.model.selected_index());
+    list.select(selected);
     let widget = List::new(items)
         .block(block)
         .highlight_symbol("▶ ")
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(Style::new().bg(Color::Indexed(236)));
+        .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(widget, area, list);
 }
 
-fn row_text(row: &Row, width: usize, view: &View) -> Text<'static> {
+fn row_text(row: &Row, width: usize, view: &View, spark: bool) -> Text<'static> {
     match row {
         Row::Group { group, collapsed } => {
             let arrow = if *collapsed { "▸" } else { "▾" };
@@ -140,13 +196,26 @@ fn row_text(row: &Row, width: usize, view: &View) -> Text<'static> {
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))
         }
-        Row::Agent { entry } => agent_text(entry, width, view.now),
+        Row::Agent { entry } => agent_text(entry, width, view, spark),
         Row::Child {
+            entry,
             child,
             guides,
             last,
-            ..
-        } => Text::from(child_line(child, guides, *last, width, view.now)),
+            ordinal,
+            period,
+        } => {
+            let lit = ordinal.is_some() && entry.wire_running();
+            let wire = Wire {
+                lit,
+                pulse: lit
+                    && view
+                        .motion_frame()
+                        .zip(*ordinal)
+                        .is_some_and(|(f, o)| pulse(f, o, *period)),
+            };
+            Text::from(child_line(child, guides, *last, wire, width, view))
+        }
         Row::More { hidden, .. } => {
             let (text, mark) = if *hidden == 0 {
                 ("  ▴ show fewer".to_string(), "[-]")
@@ -175,17 +244,22 @@ fn status_glyph(s: Status) -> Span<'static> {
     Span::styled(glyph, Style::new().fg(color))
 }
 
-fn agent_text(e: &AgentEntry, width: usize, now: i64) -> Text<'static> {
+fn agent_text(e: &AgentEntry, width: usize, view: &View, spark: bool) -> Text<'static> {
     let a = &e.agent;
+    let now = view.now;
     let busy = matches!(a.status, Status::Working | Status::Blocked);
     let dim = Style::new().fg(Color::DarkGray);
     let context = a
         .context
         .as_ref()
         .map_or(String::new(), |c| format!("{}%", c.percent));
-    let fixed = vec![
+    let glyph = match view.motion_frame() {
+        Some(f) if e.active => Span::styled(spinner(f), Style::new().fg(Color::Yellow)),
+        _ => status_glyph(a.status),
+    };
+    let mut fixed = vec![
         Span::raw("  "),
-        status_glyph(a.status),
+        glyph,
         Span::raw(" "),
         Span::styled(
             pad(&a.label, NAME_W),
@@ -197,6 +271,17 @@ fn agent_text(e: &AgentEntry, width: usize, now: i64) -> Text<'static> {
         Span::raw(format!("{context:>4}")),
         Span::raw("  "),
     ];
+    let mut title_col = TITLE_COL;
+    if spark {
+        let style = if e.rate.iter().any(|&n| n > 0) {
+            Style::new().fg(SPARK)
+        } else {
+            dim
+        };
+        fixed.push(Span::styled(sparkline(&e.rate), style));
+        fixed.push(Span::raw("  "));
+        title_col += SPARK_COLS;
+    }
     let title = match &e.crew {
         Some(item) => format!("{} {} · {}", item.id, item.status, item.deliverable),
         None => a.title.clone(),
@@ -207,33 +292,79 @@ fn agent_text(e: &AgentEntry, width: usize, now: i64) -> Text<'static> {
         e.active_at.map(|t| Span::styled(fmt_age(now - t), dim))
     };
     let mut lines = vec![spread(width, fixed, Span::raw(title), age)];
-    if busy && let Some(tool) = e.activity.as_ref().and_then(Activity::current) {
-        let indent = Span::raw(" ".repeat(TITLE_COL));
+    if busy
+        && let Some(activity) = &e.activity
+        && let Some(tool) = activity.current()
+    {
+        // Only the current call's own result settles it; an earlier parallel call that is
+        // still out does not mean this one runs.
+        let running = e.active && activity.pending.contains(&tool.id);
+        let marker = match view.motion_frame() {
+            Some(f) if running => {
+                Span::styled(format!("{} ", flow(f)), Style::new().fg(Color::Yellow))
+            }
+            _ => Span::raw("    "),
+        };
+        let indent = Span::raw(" ".repeat(title_col - 4));
         let name = Span::styled(format!("{}  ", tool.name), Style::new().fg(Color::Magenta));
         let age = tool.at.map(|t| Span::styled(fmt_age(now - t), dim));
-        lines.push(spread(
+        let mut line = spread(
             width,
-            vec![indent, name],
+            vec![indent, marker, name],
             Span::raw(tool.summary.clone()),
             age,
-        ));
+        );
+        if view.flashing(e.tool_changed_at) {
+            line = line.style(Style::new().bg(FLASH_BG));
+        }
+        lines.push(line);
     }
     Text::from(lines)
+}
+
+/// How a child row draws the agent's wire in its first column.
+struct Wire {
+    lit: bool,
+    pulse: bool,
+}
+
+fn heavy(glyph: &'static str) -> &'static str {
+    match glyph {
+        "│" => "┃",
+        "├" => "┣",
+        "└" => "┗",
+        other => other,
+    }
 }
 
 fn child_line(
     c: &ChildEntry,
     guides: &[bool],
     last: bool,
+    wire: Wire,
     width: usize,
-    now: i64,
+    view: &View,
 ) -> Line<'static> {
+    let now = view.now;
     let dim = Style::new().fg(Color::DarkGray);
+    let mut cells: Vec<&'static str> = guides
+        .iter()
+        .map(|&more| if more { "│" } else { " " })
+        .collect();
+    cells.push(if last { "└" } else { "├" });
     let mut fixed = vec![Span::raw("    ")];
-    for &more in guides {
-        fixed.push(Span::styled(if more { "│ " } else { "  " }, dim));
+    for (depth, glyph) in cells.into_iter().enumerate() {
+        let cell = match depth {
+            0 if wire.pulse => Span::styled(
+                heavy(glyph),
+                Style::new().fg(PULSE).add_modifier(Modifier::BOLD),
+            ),
+            0 if wire.lit => Span::styled(glyph, Style::new().fg(WIRE)),
+            _ => Span::styled(glyph, dim),
+        };
+        fixed.push(cell);
+        fixed.push(Span::raw(" "));
     }
-    fixed.push(Span::styled(if last { "└ " } else { "├ " }, dim));
     let text_style = if c.liveness == Liveness::Running {
         Style::new()
     } else {
@@ -259,12 +390,17 @@ fn child_line(
             let at = current.and_then(|t| t.at).or(c.active_at);
             let age = at.map_or(String::new(), |t| fmt_age(now - t));
             let right = Span::styled(format!("{} {age:>4}", pad(&tool, TOOL_W)), dim);
-            spread(
+            let line = spread(
                 width,
                 fixed,
                 Span::styled(description.clone(), text_style),
                 Some(right),
-            )
+            );
+            if view.flashing(c.tool_changed_at) {
+                line.style(Style::new().bg(FLASH_BG))
+            } else {
+                line
+            }
         }
         ChildInfo::Workflow {
             name,
@@ -284,8 +420,47 @@ fn child_line(
     }
 }
 
-fn draw_detail(frame: &mut Frame, view: &View, area: Rect) {
-    let selection = view.model.selection();
+fn draw_stream(frame: &mut Frame, view: &View, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = view
+        .stream
+        .iter()
+        .take(height)
+        .map(|item| stream_line(item, view, width))
+        .collect();
+    let block = Block::bordered().title(" live ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn stream_line(item: &StreamItem, view: &View, width: usize) -> Line<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let (text, tool) = if view.flashing(item.highlighted_at) {
+        let bright = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
+        (bright, bright.fg(Color::LightMagenta))
+    } else {
+        (Style::new(), Style::new().fg(Color::Magenta))
+    };
+    let who = match &item.child {
+        Some(child) => format!("{} › {child}", item.who),
+        None => item.who.clone(),
+    };
+    let fixed = vec![
+        Span::styled(format!(" {:>4}  ", fmt_age(view.now - item.at)), dim),
+        Span::styled(pad(&who, WHO_W), text),
+        Span::raw("  "),
+        Span::styled(pad(&item.tool, TOOL_W - 2), tool),
+        Span::raw(" "),
+    ];
+    spread(width, fixed, Span::styled(item.summary.clone(), text), None)
+}
+
+fn draw_detail(
+    frame: &mut Frame,
+    view: &View,
+    selection: Option<(&AgentEntry, Option<&ChildEntry>)>,
+    area: Rect,
+) {
     let title = selection.map_or(" details ".to_string(), |(e, _)| {
         format!(
             " {} · {} · {} ",
@@ -504,6 +679,7 @@ mod tests {
     use crate::transcript::{Activity, ToolCall};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::time::Duration;
 
     const NOW: i64 = 1_000_000;
 
@@ -574,7 +750,7 @@ mod tests {
             running_children: 2,
             frame: 0,
             instant: Instant::now(),
-            motion: true,
+            motion: false,
             stream: &[],
         }
     }
@@ -694,5 +870,190 @@ mod tests {
             .collect();
         m.update(many);
         assert!(render(&m, None).contains("2 more done"));
+    }
+
+    fn at_frame(m: &Model, frame: u64, motion: bool) -> Terminal<TestBackend> {
+        draw_on(
+            140,
+            24,
+            &View {
+                frame,
+                motion,
+                ..view(m)
+            },
+        )
+    }
+
+    fn glyph_of(term: &Terminal<TestBackend>, label: &str) -> char {
+        let s = screen(term);
+        let row = line_with(&s, &pad(label, NAME_W));
+        let i = row.find(label).unwrap();
+        row[..i].trim_end().chars().last().unwrap()
+    }
+
+    #[test]
+    fn an_active_agent_spins_and_a_stale_one_holds_still() {
+        let mut m = Model::default();
+        let mut active = working();
+        active.active = true;
+        let mut stale = entry("incr", agent("p3", "stalled", Status::Working, 3));
+        stale.active = false;
+        m.update(vec![active, stale]);
+        let (f0, f2) = (at_frame(&m, 0, true), at_frame(&m, 2, true));
+        assert_ne!(glyph_of(&f0, "worker-1"), glyph_of(&f2, "worker-1"));
+        assert_eq!(glyph_of(&f0, "stalled"), '◐');
+        assert_eq!(glyph_of(&f2, "stalled"), '◐');
+    }
+
+    fn pulse_cells(term: &Terminal<TestBackend>) -> Vec<(u16, String)> {
+        let buf = term.backend().buffer();
+        let mut cells = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].fg == PULSE {
+                    cells.push((y, buf[(x, y)].symbol().to_string()));
+                }
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn one_bright_cell_runs_down_the_wire() {
+        let mut m = Model::default();
+        let mut e = entry("incr", agent("p1", "w1", Status::Working, 1));
+        e.active = true;
+        e.children = vec![
+            subagent("c1", Liveness::Running, vec![]),
+            subagent("c2", Liveness::Done, vec![]),
+            subagent("c3", Liveness::Running, vec![]),
+        ];
+        m.update(vec![e]);
+        let row_of = |term: &Terminal<TestBackend>, needle: &str| {
+            screen(term)
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap() as u16
+        };
+        for (frame, child, glyph) in [
+            (0, "c1", "┣"),
+            (2, "c2", "┣"),
+            (4, "c3", "┗"),
+            (6, "c1", "┣"),
+        ] {
+            let term = at_frame(&m, frame, true);
+            assert_eq!(
+                pulse_cells(&term),
+                vec![(row_of(&term, &format!("{child} desc")), glyph.to_string())],
+                "frame {frame}"
+            );
+        }
+        let off = at_frame(&m, 2, false);
+        assert!(pulse_cells(&off).is_empty());
+        assert_eq!(screen(&off), screen(&at_frame(&m, 0, false)));
+    }
+
+    #[test]
+    fn a_blocked_agent_has_no_lit_wire() {
+        let mut m = Model::default();
+        let mut e = entry("incr", agent("p1", "w1", Status::Blocked, 1));
+        e.children = vec![subagent("c1", Liveness::Running, vec![])];
+        m.update(vec![e]);
+        let buf_has = |term: &Terminal<TestBackend>, color| {
+            let buf = term.backend().buffer();
+            buf.content().iter().any(|c| c.fg == color)
+        };
+        let term = at_frame(&m, 0, true);
+        assert!(!buf_has(&term, PULSE) && !buf_has(&term, WIRE));
+    }
+
+    #[test]
+    fn flow_marks_only_a_pending_current_call() {
+        let mut m = Model::default();
+        let mut e = working();
+        e.active = true;
+        m.update(vec![e.clone()]);
+        let s = screen(&at_frame(&m, 0, true));
+        assert!(line_with(&s, "cargo nextest").contains("•··"));
+        let act = e.activity.as_mut().unwrap();
+        act.pending.clear();
+        act.pending.insert("Read40".into());
+        m.update(vec![e]);
+        let s = screen(&at_frame(&m, 0, true));
+        assert!(!line_with(&s, "cargo nextest").contains('•'));
+    }
+
+    #[test]
+    fn a_new_tool_flashes_its_row_for_a_moment() {
+        let mut m = Model::default();
+        let mut e = working();
+        let at = Instant::now();
+        e.tool_changed_at = Some(at);
+        m.update(vec![e]);
+        let flashed = |instant| {
+            let term = draw_on(
+                140,
+                24,
+                &View {
+                    instant,
+                    ..view(&m)
+                },
+            );
+            let y = screen(&term)
+                .lines()
+                .position(|l| l.contains("cargo nextest"))
+                .unwrap() as u16;
+            term.backend().buffer()[(40, y)].bg == FLASH_BG
+        };
+        assert!(flashed(at + Duration::from_millis(100)));
+        assert!(!flashed(at + FLASH));
+    }
+
+    #[test]
+    fn the_sparkline_needs_a_wide_tree() {
+        let mut m = Model::default();
+        let mut e = working();
+        e.rate[RATE_BUCKETS - 1] = 6;
+        e.rate[RATE_BUCKETS - 2] = 3;
+        m.update(vec![e]);
+        let wide = screen(&draw_on(170, 24, &view(&m)));
+        assert!(line_with(&wide, &pad("worker-1", NAME_W)).contains("▁▁▁▁▁▁▁▁▅█"));
+        let narrow = screen(&draw_on(140, 24, &view(&m)));
+        assert!(!line_with(&narrow, &pad("worker-1", NAME_W)).contains('█'));
+    }
+
+    fn stream_item(id: &str, ago: i64, child: Option<&str>) -> StreamItem {
+        StreamItem {
+            id: id.into(),
+            at: NOW - ago,
+            who: "worker-1".into(),
+            child: child.map(String::from),
+            tool: "Grep".into(),
+            summary: format!("{id} summary"),
+            highlighted_at: None,
+        }
+    }
+
+    #[test]
+    fn the_stream_lists_newest_first_and_needs_a_tall_terminal() {
+        let mut m = Model::default();
+        m.update(vec![working()]);
+        let items = [
+            stream_item("new", 1, Some("Explore")),
+            stream_item("old", 9, None),
+        ];
+        let v = View {
+            stream: &items,
+            ..view(&m)
+        };
+        let s = screen(&draw_on(140, 30, &v));
+        assert!(s.contains(" live "));
+        let new = s.lines().position(|l| l.contains("new summary")).unwrap();
+        let old = s.lines().position(|l| l.contains("old summary")).unwrap();
+        assert!(new < old);
+        assert!(line_with(&s, "new summary").contains("worker-1 › Explore"));
+        assert!(line_with(&s, "old summary").contains("9s"));
+        let short = screen(&draw_on(140, 29, &v));
+        assert!(!short.contains(" live ") && !short.contains("new summary"));
     }
 }

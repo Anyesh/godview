@@ -293,7 +293,11 @@ impl Model {
     /// The selected row's index, after following a selection whose node went away: a child
     /// hands it to its agent, anything else to the row at the same position.
     pub fn selected_index(&self) -> Option<usize> {
-        let rows = self.rows();
+        self.selected_index_in(&self.rows())
+    }
+
+    /// [`Model::selected_index`] within rows the caller already built.
+    pub fn selected_index_in(&self, rows: &[(NodeId, Row<'_>)]) -> Option<usize> {
         if rows.is_empty() {
             return None;
         }
@@ -348,8 +352,15 @@ impl Model {
 
     /// The selected agent, and the selected child under it if any.
     pub fn selection(&self) -> Option<(&AgentEntry, Option<&ChildEntry>)> {
-        let index = self.selected_index()?;
-        match self.rows().into_iter().nth(index)?.1 {
+        let rows = self.rows();
+        rows.get(self.selected_index_in(&rows)?)?.1.selection()
+    }
+}
+
+impl<'a> Row<'a> {
+    /// The agent on this row, and the child too on a child row.
+    pub fn selection(&self) -> Option<(&'a AgentEntry, Option<&'a ChildEntry>)> {
+        match *self {
             Row::Agent { entry } => Some((entry, None)),
             Row::Child { entry, child, .. } => Some((entry, Some(child))),
             Row::Group { .. } | Row::More { .. } => None,
