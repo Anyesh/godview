@@ -70,6 +70,8 @@ pub struct WorkflowAgent {
     pub state: String,
     pub last_tool: Option<String>,
     pub last_summary: Option<String>,
+    /// Epoch milliseconds.
+    pub last_progress_at: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -267,6 +269,7 @@ impl Children {
                 state: p["state"].as_str().unwrap_or_default().to_string(),
                 last_tool: p["lastToolName"].as_str().map(String::from),
                 last_summary: p["lastToolSummary"].as_str().map(String::from),
+                last_progress_at: p["lastProgressAt"].as_i64(),
             })
             .collect();
         entry.phase = current_phase(&v, progress);
@@ -599,7 +602,7 @@ mod tests {
                 {"type":"workflow_phase","index":1,"title":"Review"},
                 {"type":"workflow_agent","label":"r1","phaseIndex":1,"state":"done"},
                 {"type":"workflow_phase","index":2,"title":"Verify"},
-                {"type":"workflow_agent","label":"v1","phaseIndex":2,"state":"progress","lastToolName":"Read","lastToolSummary":"src/a.rs"},
+                {"type":"workflow_agent","label":"v1","phaseIndex":2,"state":"progress","lastToolName":"Read","lastToolSummary":"src/a.rs","lastProgressAt":1793006001912_i64},
                 {"type":"workflow_agent","label":"v2","phaseIndex":2,"state":"start"}]});
         fs::write(f.session.join("workflows/wf_1.json"), wf.to_string()).unwrap();
         let mut c = Children::new(f.session.clone());
@@ -616,6 +619,8 @@ mod tests {
             })
         );
         assert_eq!(w.agents.len(), 3);
+        assert_eq!(w.agents[1].last_progress_at, Some(1_793_006_001_912));
+        assert_eq!(w.agents[2].last_progress_at, None);
         assert_eq!(w.running_agents(), 2);
         assert_eq!(w.liveness(now), Liveness::Running);
         assert_eq!(c.tree(now, false)[0].key, ChildKey::Workflow("wf_1".into()));
