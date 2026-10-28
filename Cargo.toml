@@ -2,6 +2,7 @@
 name = "godview"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A herdr pane showing every agent and its subagents in one live tree."
 license = "MIT"
 repository = "https://github.com/Anyesh/godview"
