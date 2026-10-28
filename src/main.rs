@@ -82,27 +82,26 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
     let mut dirty = true;
     let mut urgent = true;
     let mut last_draw = Instant::now();
+    let mut ticks = Deadline::new(Instant::now());
     loop {
-        if dirty && (urgent || last_draw.elapsed() >= DEBOUNCE) {
+        let now = Instant::now();
+        if ticks.due(now, app.tick_interval()) {
+            app.tick();
+            dirty = true;
+        }
+        if dirty && (urgent || now.duration_since(last_draw) >= DEBOUNCE) {
             terminal.draw(|f| ui::draw(f, &app.view(), &mut list))?;
             last_draw = Instant::now();
             dirty = false;
             urgent = false;
         }
-        let wait = if dirty {
-            DEBOUNCE.saturating_sub(last_draw.elapsed())
-        } else {
-            app.tick_interval()
-        };
+        let mut wait = ticks.left(Instant::now());
+        if dirty {
+            wait = wait.min(DEBOUNCE.saturating_sub(last_draw.elapsed()));
+        }
         let first = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
-            Err(RecvTimeoutError::Timeout) => {
-                if !dirty {
-                    app.tick();
-                    dirty = true;
-                }
-                continue;
-            }
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
         for msg in std::iter::once(first).chain(rx.try_iter()) {
@@ -116,5 +115,49 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
                 Effect::None => {}
             }
         }
+    }
+}
+
+/// A tick deadline that messages arriving in between do not push back.
+#[derive(Debug)]
+struct Deadline {
+    next: Instant,
+}
+
+impl Deadline {
+    fn new(now: Instant) -> Self {
+        Deadline { next: now }
+    }
+
+    /// `true` once the deadline passed, and the next one is then `interval` away.
+    fn due(&mut self, now: Instant, interval: Duration) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + interval;
+        true
+    }
+
+    fn left(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_messages_do_not_postpone_the_tick() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut d = Deadline::new(start);
+        assert!(d.due(start, second));
+        let fired: Vec<bool> = (1..=12)
+            .map(|i| d.due(start + Duration::from_millis(100 * i), second))
+            .collect();
+        assert_eq!(fired.iter().filter(|f| **f).count(), 1);
+        assert!(fired[9]);
+        assert_eq!(d.left(start + second), second);
     }
 }

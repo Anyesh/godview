@@ -73,6 +73,14 @@ impl App {
     }
 
     pub fn handle(&mut self, msg: Msg) -> Effect {
+        let effect = self.dispatch(msg);
+        if effect == Effect::Redraw && self.peek_is_stale() {
+            self.refresh_peek();
+        }
+        effect
+    }
+
+    fn dispatch(&mut self, msg: Msg) -> Effect {
         match msg {
             Msg::Feed(FeedMsg::Snapshot(snapshot)) => {
                 self.status = None;
@@ -105,12 +113,14 @@ impl App {
         }
     }
 
+    /// Seconds-resolution ages only show for working agents and peeked output; a blocked
+    /// agent can sit on a prompt for hours and needs no 1 Hz redraw.
     pub fn tick_interval(&self) -> Duration {
         let busy = self
             .snapshot
             .agents
             .iter()
-            .any(|a| matches!(a.status, Status::Working | Status::Blocked));
+            .any(|a| a.status == Status::Working);
         if busy || self.model.peek {
             BUSY_TICK
         } else {
@@ -123,7 +133,11 @@ impl App {
         View {
             model: &self.model,
             now: epoch(now),
-            peek: self.peek.as_ref().map(|(_, text)| text.as_str()),
+            peek: self
+                .peek
+                .as_ref()
+                .filter(|(pane, _)| Some(pane.as_str()) == self.selected_pane())
+                .map(|(_, text)| text.as_str()),
             status: self.status.as_deref(),
             running_children: self
                 .sessions
@@ -261,12 +275,12 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Effect::Quit,
             KeyCode::Char('c') if ctrl => return Effect::Quit,
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
-            KeyCode::Char('g') | KeyCode::Home => self.move_selection(isize::MIN / 2),
-            KeyCode::Char('G') | KeyCode::End => self.move_selection(isize::MAX / 2),
+            KeyCode::Char('j') | KeyCode::Down => self.model.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.model.move_selection(-1),
+            KeyCode::PageDown => self.model.move_selection(10),
+            KeyCode::PageUp => self.model.move_selection(-10),
+            KeyCode::Char('g') | KeyCode::Home => self.model.move_selection(isize::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => self.model.move_selection(isize::MAX / 2),
             KeyCode::Char(' ') => self.model.toggle_fold(),
             KeyCode::Char('w') => {
                 let on = !self.model.working_only();
@@ -286,13 +300,6 @@ impl App {
             _ => return Effect::None,
         }
         Effect::Redraw
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        self.model.move_selection(delta);
-        if self.model.peek {
-            self.refresh_peek();
-        }
     }
 
     fn focus_selected(&mut self) {
@@ -315,6 +322,18 @@ impl App {
             .read_pane(&pane, PEEK_LINES)
             .unwrap_or_else(|e| format!("could not read the pane: {e:#}"));
         self.peek = Some((pane, text));
+    }
+
+    fn selected_pane(&self) -> Option<&str> {
+        self.model
+            .selection()
+            .map(|(entry, _)| entry.agent.pane_id.as_str())
+    }
+
+    /// The selection moved to another pane without a key: its pane closed, a filter or fold
+    /// hid it, or rows reordered.
+    fn peek_is_stale(&self) -> bool {
+        self.model.peek && self.peek.as_ref().map(|(pane, _)| pane.as_str()) != self.selected_pane()
     }
 }
 
