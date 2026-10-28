@@ -5,6 +5,7 @@ mod children;
 mod crew;
 mod feed;
 mod herdr;
+mod live;
 mod log;
 mod model;
 mod profile;
