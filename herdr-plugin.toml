@@ -1,0 +1,24 @@
+id = "godview"
+name = "godview"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+platforms = ["linux"]
+description = "One live tree of every agent in the session, with its subagents and workflows nested under it."
+
+# `plugin link` skips this, so run `cargo build --release` by hand for a linked checkout.
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[panes]]
+id = "view"
+title = "godview"
+placement = "tab"
+command = ["target/release/godview"]
+
+# `herdr plugin pane` has no list, so the binary finds a running godview pane itself and
+# focuses it, which keeps one instance across every workspace.
+[[actions]]
+id = "open"
+title = "godview: open"
+contexts = ["pane", "workspace"]
+command = ["target/release/godview", "--action", "open"]
