@@ -4,8 +4,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _, Result};
-use serde_json::{json, Value};
+use anyhow::{Context as _, Result, anyhow, bail};
+use serde_json::{Value, json};
 
 const ANSWER: Duration = Duration::from_secs(5);
 
@@ -288,10 +288,10 @@ pub mod fake {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// A herdr stand-in: answers `session.snapshot` with the current snapshot, keeps
     /// subscriptions open, and records every request.

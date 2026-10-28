@@ -89,7 +89,7 @@ pub struct Model {
     last_index: usize,
     collapsed: HashSet<NodeId>,
     expanded_more: HashSet<String>,
-    pub working_only: bool,
+    working_only: bool,
     pub all_children: bool,
     pub peek: bool,
 }
@@ -145,6 +145,10 @@ impl Model {
         });
         self.groups = groups;
         self.settle_selection();
+    }
+
+    pub fn working_only(&self) -> bool {
+        self.working_only
     }
 
     pub fn set_working_only(&mut self, on: bool) {

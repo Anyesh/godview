@@ -5,9 +5,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::herdr::{error_code, Client, Snapshot};
+use crate::herdr::{Client, Snapshot, error_code};
 
 /// The session events that can change what godview shows; each one triggers a fresh snapshot.
 /// Output events are left out, so output bursts cost nothing.
@@ -241,7 +241,7 @@ fn read_lines(tag: u64, reader: BufReader<UnixStream>, tx: Sender<FeedIn>) {
 mod tests {
     use super::*;
     use crate::herdr::fake::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::io::Read;
     use std::time::Instant;
 

@@ -103,8 +103,17 @@ fn find_main(cwd: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    pub fn item(id: &str, status: &str, deliverable: &str) -> Item {
+        Item {
+            id: id.into(),
+            status: status.into(),
+            deliverable: deliverable.into(),
+            updated: 0,
+        }
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
