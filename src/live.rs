@@ -166,8 +166,13 @@ mod tests {
     fn first_sight_flashes_and_highlights_nothing() {
         let mut t = Tracker::new(WALL);
         let now = Instant::now();
-        let c = call("t1", WALL);
-        let stream = t.update(&[(pane("p1"), Some(&c))], vec![item("t1", WALL)], WALL, now);
+        let c = call("t1", WALL - 2);
+        let stream = t.update(
+            &[(pane("p1"), Some(&c))],
+            vec![item("t1", WALL - 2)],
+            WALL,
+            now,
+        );
         assert_eq!(t.changed_at(&pane("p1")), None);
         assert_eq!(stream[0].highlighted_at, None);
         assert_eq!(t.fade_until(), None);
