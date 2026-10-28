@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -101,7 +102,7 @@ impl Tracker {
         self.changed_at.retain(|k, _| keys.contains(k));
 
         let mut stream = items;
-        stream.sort_by(|a, b| b.at.cmp(&a.at));
+        stream.sort_by_key(|i| Reverse(i.at));
         stream.truncate(STREAM_LEN);
         for item in &mut stream {
             item.highlighted_at = match self.first_seen.get(&item.id) {
