@@ -3,24 +3,31 @@
 A [herdr](https://herdr.dev) plugin pane that shows every agent in your herdr session as one live tree, with each Claude Code agent's subagents and workflows nested under it.
 
 ```
- godview   18 agents · 5 working · 1 subagent running                                  w working only · a all
-┌ agents ──────────────────────────────────────────────────────────────┐┌ worker-3 · beta · incr ────────────┐
-│▶ ▾ incr                                                              ││Integrator handoff                  │
-│    ◐ worker-1     alpha     31%  rule A natural walk                 ││context 44% (438k) · cache hit 99.7%│
-│                                  Bash  cargo nextest run -p s…   12s ││                                    │
-│    ◐ worker-3     beta      44%  Integrator handoff                  ││recent tools                        │
-│                                  Agent  Review T10 diff          20s ││  20s  Agent  Review T10 diff       │
-│      ├ ● code-reviewer   Review T10 scan-two diff   Read         20s ││   4s  Read   src/sched/lib.rs      │
-│      └ ◆ workflow review-changes   Verify 3/5 · 7 agents          1m ││                                    │
-│    ✳ integrator   beta      32%  Multi-agent handoff              2m ││last text                           │
-│    ✳ 9 more done                                                 [+] ││ Audit subagent is still running.   │
-│  ▾ harness                                                           ││                                    │
-│    ○ harness      alpha      9%  Herdr god view                   8m ││                                    │
-└──────────────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
- j/k move · enter go to pane · p peek output · space fold/expand · q quit
+ godview   18 agents · 5 working · 2 subagents running                               m motion · w working only · a all
+┌ agents ─────────────────────────────────────────────────────────────────────────┐┌ worker-3 · beta · incr ──────────┐
+│▶ ▾ incr                                                                         ││Integrator handoff                │
+│    ◓ worker-3     beta      44%  ▁▂▅▇▅▃▂▃▅▇  Integrator handoff                 ││context 44% (438k) · cache 99.7%  │
+│                                          ··• Agent  Review T10 scan-two di… 20s ││                                  │
+│      ┣ ● general-purpose Apply CHANGELOG audit list               Edit       4s ││recent tools                      │
+│      ┃ └ ● Explore         Find stale CHANGELOG refs              Grep       1s ││  20s  Agent  Review T10 scan-two │
+│      └ ● code-reviewer   Review T10 scan-two diff                 Read      20s ││   4s  Read   crates/sched/lib.rs │
+│    ◑ worker-5     gamma     27%  ▁▁▂▂▃▂▁▂▃▂  886d3 op22 crosstwo both-panic     ││                                  │
+│                                              Read  src/sched/cross.rs        3s ││last text                         │
+│    ◐ worker-9     beta      35%  ▅▃▁▁▁▁▁▁▁▁  Incr T8 shared-hang worker-9       ││ Audit subagent is still running. │
+│                                              Bash  cargo nextest run         4m ││                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────┘
+┌ live ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   0s  worker-5                    Read   src/sched/cross.rs                                                         │
+│   1s  worker-3 › Explore          Grep   stale CHANGELOG refs                                                       │
+│   4s  worker-3 › general-purpose  Edit   CHANGELOG.md                                                               │
+│   9s  harness › wf review:app     Read   src/app.rs                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k move · enter go to pane · p peek · space fold · m motion · q quit
 ```
 
-Each agent line shows herdr's status (`◐` working, `◉` blocked, `✳` done, `○` idle), the Claude profile, context use, the session title and, for working agents, the tool running now. Agents are grouped by the main checkout of their working directory. Agents that are crew workers show their board item from `.claude/crew/board.tsv` instead of the title.
+Each agent line shows herdr's status (`◐` working, `◉` blocked, `✳` done, `○` idle), the Claude profile, context use, tool calls per minute over the last ten minutes (on a tree pane at least 100 columns wide), the session title and, for working agents, the tool running now. Agents are grouped by the main checkout of their working directory. Agents that are crew workers show their board item from `.claude/crew/board.tsv` instead of the title.
+
+Motion follows real activity. A working agent spins while its transcript was written in the last minute, or it waits on a tool call and was written in the last ten minutes, so one that says working but has gone quiet holds still. While an agent that is not blocked has a running subagent or workflow, its first connector column turns cyan and a bright cell runs down it. `··•` steps along a tool line while that call is still out, and a row flashes when it starts a new call. The `live` strip at the bottom (on terminals at least 30 rows tall) lists every agent's, running subagent's and workflow agent's calls, newest first. Frames run at 8 per second only while something moves, so an idle view draws nothing.
 
 ## Install
 
@@ -50,6 +57,7 @@ description = "godview: every agent and its subagents"
 | `w` | show working and blocked agents only |
 | `a` | also show finished and stale subagents and workflows |
 | `space` | fold or unfold a repo, an agent's children, or the "more done" row |
+| `m` | turn motion off or on; sparklines, flashes and the live strip stay |
 | `q` | quit |
 
 ## Where the data comes from
