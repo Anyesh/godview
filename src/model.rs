@@ -1,12 +1,28 @@
 use std::collections::HashSet;
+use std::time::Instant;
 
-use crate::children::{ChildKey, Liveness, Phase, WorkflowAgent};
+use crate::children::{ChildKey, Liveness, PENDING_WINDOW, Phase, WorkflowAgent};
 use crate::crew::Item;
 use crate::herdr::{Agent, Status};
-use crate::transcript::Activity;
+use crate::transcript::{Activity, RATE_BUCKETS};
 
 /// Done agents shown in a group before the rest fold into one row.
 pub const DONE_SHOWN: usize = 3;
+/// How long a working agent that waits on no call may go without a transcript write
+/// before it stops reading as active.
+const ACTIVE_FRESH: i64 = 60;
+
+/// A working agent whose transcript moves, so a stalled one holds still on screen. Mirrors
+/// the subagent liveness rule in `children.rs`.
+pub fn is_active(status: Status, activity: Option<&Activity>, now: i64) -> bool {
+    let Some(a) = activity.filter(|_| status == Status::Working) else {
+        return false;
+    };
+    a.last_at.is_some_and(|at| {
+        let age = now - at;
+        age <= ACTIVE_FRESH || (a.is_pending() && age <= PENDING_WINDOW.as_secs() as i64)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub enum ChildInfo {
@@ -30,7 +46,14 @@ pub struct ChildEntry {
     pub liveness: Liveness,
     pub info: ChildInfo,
     pub active_at: Option<i64>,
+    pub tool_changed_at: Option<Instant>,
     pub children: Vec<ChildEntry>,
+}
+
+impl ChildEntry {
+    fn running(&self) -> bool {
+        self.liveness == Liveness::Running || self.children.iter().any(ChildEntry::running)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +65,17 @@ pub struct AgentEntry {
     pub crew: Option<Item>,
     pub activity: Option<Activity>,
     pub active_at: Option<i64>,
+    pub active: bool,
+    pub rate: [u16; RATE_BUCKETS],
+    pub tool_changed_at: Option<Instant>,
     pub children: Vec<ChildEntry>,
+}
+
+impl AgentEntry {
+    /// Work is in flight under this agent. A blocked agent's children wait on its prompt.
+    pub fn wire_running(&self) -> bool {
+        self.agent.status != Status::Blocked && self.children.iter().any(ChildEntry::running)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -75,6 +108,10 @@ pub enum Row<'a> {
         /// Per ancestor level below the agent, whether a later sibling continues its line.
         guides: Vec<bool>,
         last: bool,
+        /// Position on the agent's wire, `None` where the first column is blank.
+        ordinal: Option<usize>,
+        /// How many of the agent's visible rows the wire crosses.
+        period: usize,
     },
     More {
         hidden: usize,
@@ -211,7 +248,9 @@ impl Model {
                 let folded = self.collapsed.contains(&agent_id);
                 rows.push((agent_id, Row::Agent { entry }));
                 if !folded {
+                    let start = rows.len();
                     self.push_children(&mut rows, entry, &entry.children, &mut Vec::new());
+                    number_wire(&mut rows[start..]);
                 }
                 if done && expanded && done_seen == done_total && done_total > DONE_SHOWN {
                     rows.push(more());
@@ -239,6 +278,8 @@ impl Model {
                     child,
                     guides: guides.clone(),
                     last,
+                    ordinal: None,
+                    period: 0,
                 },
             ));
             if !folded && !child.children.is_empty() {
@@ -316,9 +357,36 @@ impl Model {
     }
 }
 
+/// Numbers one agent's child rows along the wire in its first column: a top-level branch,
+/// or the guide of a top-level child with a later sibling.
+fn number_wire(rows: &mut [(NodeId, Row<'_>)]) {
+    let crosses = |guides: &[bool]| guides.first().copied().unwrap_or(true);
+    let period = rows
+        .iter()
+        .filter(|(_, r)| matches!(r, Row::Child { guides, .. } if crosses(guides)))
+        .count();
+    let mut next = 0;
+    for (_, row) in rows {
+        if let Row::Child {
+            guides,
+            ordinal,
+            period: p,
+            ..
+        } = row
+        {
+            *p = period;
+            if crosses(guides) {
+                *ordinal = Some(next);
+                next += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::transcript::RATE_BUCKETS;
 
     pub fn agent(pane: &str, label: &str, status: Status, seq: u64) -> Agent {
         Agent {
@@ -347,6 +415,9 @@ pub mod tests {
             crew: None,
             activity: None,
             active_at: None,
+            active: false,
+            rate: [0; RATE_BUCKETS],
+            tool_changed_at: None,
             children: Vec::new(),
         }
     }
@@ -361,8 +432,109 @@ pub mod tests {
                 activity: None,
             },
             active_at: None,
+            tool_changed_at: None,
             children,
         }
+    }
+
+    fn wire(m: &Model) -> Vec<(String, Option<usize>, usize)> {
+        m.rows()
+            .into_iter()
+            .filter_map(|(_, r)| match r {
+                Row::Child {
+                    child,
+                    ordinal,
+                    period,
+                    ..
+                } => match &child.key {
+                    ChildKey::Subagent(id) => Some((id.clone(), ordinal, period)),
+                    ChildKey::Workflow(_) => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_wire_numbers_rows_whose_first_column_it_crosses() {
+        use Liveness::{Done, Running};
+        let mut m = Model::default();
+        let mut e = entry("incr", agent("p1", "w1", Status::Working, 1));
+        e.children = vec![
+            subagent(
+                "c1",
+                Running,
+                vec![subagent(
+                    "c2",
+                    Running,
+                    vec![subagent("c3", Running, vec![])],
+                )],
+            ),
+            subagent("c4", Done, vec![]),
+            subagent("c5", Running, vec![subagent("c6", Running, vec![])]),
+        ];
+        m.update(vec![e]);
+        let s = |id: &str, o: Option<usize>, p: usize| (id.to_string(), o, p);
+        assert_eq!(
+            wire(&m),
+            vec![
+                s("c1", Some(0), 5),
+                s("c2", Some(1), 5),
+                s("c3", Some(2), 5),
+                s("c4", Some(3), 5),
+                s("c5", Some(4), 5),
+                s("c6", None, 5),
+            ]
+        );
+        m.move_selection(1);
+        m.toggle_fold();
+        assert_eq!(
+            wire(&m),
+            vec![
+                s("c1", Some(0), 3),
+                s("c4", Some(1), 3),
+                s("c5", Some(2), 3),
+                s("c6", None, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_means_working_and_writing_or_waiting_on_a_call() {
+        const NOW: i64 = 1_000_000;
+        let act = |ago: i64, pending: bool| {
+            let mut a = Activity {
+                last_at: Some(NOW - ago),
+                ..Activity::default()
+            };
+            if pending {
+                a.pending.insert("t1".into());
+            }
+            a
+        };
+        assert!(is_active(Status::Working, Some(&act(10, false)), NOW));
+        assert!(is_active(Status::Working, Some(&act(300, true)), NOW));
+        assert!(!is_active(Status::Working, Some(&act(300, false)), NOW));
+        assert!(!is_active(Status::Working, Some(&act(700, true)), NOW));
+        assert!(!is_active(Status::Blocked, Some(&act(1, true)), NOW));
+        assert!(!is_active(Status::Working, None, NOW));
+    }
+
+    #[test]
+    fn a_wire_runs_under_any_running_child_unless_the_agent_is_blocked() {
+        let with = |status, liveness| {
+            let mut e = entry("incr", agent("p1", "w1", status, 1));
+            e.children = vec![subagent(
+                "c1",
+                Liveness::Done,
+                vec![subagent("c2", liveness, vec![])],
+            )];
+            e.wire_running()
+        };
+        assert!(with(Status::Working, Liveness::Running));
+        assert!(with(Status::Done, Liveness::Running));
+        assert!(!with(Status::Blocked, Liveness::Running));
+        assert!(!with(Status::Working, Liveness::Stale));
     }
 
     fn ids(m: &Model) -> Vec<NodeId> {

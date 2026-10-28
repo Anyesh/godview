@@ -541,6 +541,7 @@ mod tests {
                 running: 7,
             },
             active_at: Some(NOW - 60),
+            tool_changed_at: None,
             children: Vec::new(),
         };
         e.children = vec![child, workflow];

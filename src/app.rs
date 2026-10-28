@@ -8,9 +8,9 @@ use crate::children::{ChildKey, ChildTree, Children};
 use crate::crew::Repos;
 use crate::feed::{Feed, FeedMsg};
 use crate::herdr::{Client, Snapshot, Status};
-use crate::model::{AgentEntry, ChildEntry, ChildInfo, Model};
+use crate::model::{self, AgentEntry, ChildEntry, ChildInfo, Model};
 use crate::profile::Profiles;
-use crate::transcript::{self, Tail};
+use crate::transcript::{self, RATE_BUCKETS, Tail};
 use crate::ui::View;
 use crate::watch::{self, Change, Target, Watches};
 
@@ -263,6 +263,11 @@ impl App {
                 group_label,
                 crew,
                 active_at: activity.as_ref().and_then(|x| x.last_at),
+                active: model::is_active(a.status, activity.as_ref(), epoch(now)),
+                rate: activity
+                    .as_ref()
+                    .map_or([0; RATE_BUCKETS], |x| x.rate(epoch(now))),
+                tool_changed_at: None,
                 activity,
                 children,
             });
@@ -373,6 +378,7 @@ fn child_entries(children: &Children, tree: Vec<ChildTree>) -> Vec<ChildEntry> {
                 liveness: t.liveness,
                 info,
                 active_at,
+                tool_changed_at: None,
                 children: child_entries(children, t.children),
             })
         })
