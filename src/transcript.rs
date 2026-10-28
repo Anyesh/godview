@@ -10,6 +10,9 @@ const SUMMARY_CHARS: usize = 80;
 const TEXT_CHARS: usize = 400;
 const RECENT: usize = 10;
 const PENDING_CAP: usize = 64;
+pub const RATE_BUCKETS: usize = 10;
+const BUCKET_SECS: i64 = 60;
+const CALLS_CAP: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
@@ -26,6 +29,8 @@ pub struct Activity {
     pub last_text: Option<String>,
     pub waiting_on_user: bool,
     pub last_at: Option<i64>,
+    /// When each tool call of the last [`RATE_BUCKETS`] minutes started, oldest first.
+    pub calls: VecDeque<i64>,
 }
 
 impl Activity {
@@ -35,6 +40,27 @@ impl Activity {
 
     pub fn is_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// Calls per minute over the last [`RATE_BUCKETS`] minutes, the current minute last.
+    pub fn rate(&self, now: i64) -> [u16; RATE_BUCKETS] {
+        let mut buckets = [0u16; RATE_BUCKETS];
+        for &at in &self.calls {
+            let ago = ((now - at).max(0) / BUCKET_SECS) as usize;
+            if ago < RATE_BUCKETS {
+                let b = &mut buckets[RATE_BUCKETS - 1 - ago];
+                *b = b.saturating_add(1);
+            }
+        }
+        buckets
+    }
+
+    fn record_call(&mut self, at: i64) {
+        self.calls.push_back(at);
+        let oldest = at - RATE_BUCKETS as i64 * BUCKET_SECS;
+        while self.calls.len() > CALLS_CAP || self.calls.front().is_some_and(|&t| t <= oldest) {
+            self.calls.pop_front();
+        }
     }
 }
 
@@ -142,6 +168,9 @@ impl Tail {
                     let id = block["id"].as_str().unwrap_or_default().to_string();
                     if self.activity.pending.len() < PENDING_CAP {
                         self.activity.pending.insert(id.clone());
+                    }
+                    if let Some(at) = at {
+                        self.activity.record_call(at);
                     }
                     self.activity.recent.push_back(ToolCall {
                         id,
@@ -408,6 +437,67 @@ mod tests {
         assert_eq!(t.activity.recent.front().unwrap().summary, "f5");
     }
 
+    fn calls_at(ts: &[i64]) -> Vec<u8> {
+        let ls: Vec<String> = ts
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                json!({"type":"assistant","timestamp":iso(t),"message":{"id":format!("m{i}"),
+                    "content":[{"type":"tool_use","id":format!("t{i}"),"name":"Read","input":{}}]}})
+                .to_string()
+            })
+            .collect();
+        lines(&ls)
+    }
+
+    fn iso(epoch: i64) -> String {
+        let (days, secs) = (epoch.div_euclid(86_400), epoch.rem_euclid(86_400));
+        let mut d = days + 719_468;
+        let era = d.div_euclid(146_097);
+        d -= era * 146_097;
+        let yoe = (d - d / 1460 + d / 36_524 - d / 146_096) / 365;
+        let doy = d - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        )
+    }
+
+    const T0: i64 = 1_793_184_616;
+
+    #[test]
+    fn rate_counts_calls_per_minute_with_the_newest_last() {
+        let mut t = Tail::default();
+        t.ingest(&calls_at(&[T0 - 600, T0 - 599, T0 - 60, T0 - 59, T0, T0]));
+        let mut want = [0u16; RATE_BUCKETS];
+        want[0] = 1;
+        want[8] = 1;
+        want[9] = 3;
+        assert_eq!(t.activity.rate(T0), want);
+        assert_eq!(t.activity.rate(T0 + 600), [0; RATE_BUCKETS]);
+    }
+
+    #[test]
+    fn calls_older_than_ten_minutes_drop_out() {
+        let mut t = Tail::default();
+        t.ingest(&calls_at(&[T0, T0 + 1, T0 + 700]));
+        assert_eq!(t.activity.calls, VecDeque::from([T0 + 700]));
+    }
+
+    #[test]
+    fn call_history_is_capped() {
+        let mut t = Tail::default();
+        t.ingest(&calls_at(&vec![T0; CALLS_CAP + 20]));
+        assert_eq!(t.activity.calls.len(), CALLS_CAP);
+        assert_eq!(t.activity.rate(T0)[RATE_BUCKETS - 1], CALLS_CAP as u16);
+    }
+
     #[test]
     fn read_resumes_from_offset_and_drops_first_partial_after_seek() {
         let dir = tempfile::tempdir().unwrap();
@@ -483,6 +573,7 @@ mod tests {
 
     #[test]
     fn timestamps_parse_to_epoch_seconds() {
+        assert_eq!(parse_timestamp(&iso(T0)), Some(T0));
         assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_timestamp("2000-03-01T00:00:01.5Z"), Some(951_868_801));
         assert_eq!(parse_timestamp("nope"), None);
