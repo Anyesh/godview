@@ -1,7 +1,9 @@
 id = "godview"
 name = "godview"
 version = "0.1.0"
-min_herdr_version = "0.9.5"
+# 0.9.3 has everything the socket client reads: `session.snapshot`, per-pane status
+# subscriptions, `events_lost`, and the agent `tokens` and `agent_session` fields.
+min_herdr_version = "0.9.3"
 platforms = ["linux"]
 description = "One live tree of every agent in the session, with its subagents and workflows nested under it."
 
