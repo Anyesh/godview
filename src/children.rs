@@ -183,11 +183,11 @@ impl Children {
                 self.load_subagent(id, now);
                 return true;
             }
-        } else if parent == self.workflows_dir() {
-            if let Some(id) = workflow_id(name) {
-                self.load_workflow(id);
-                return true;
-            }
+        } else if parent == self.workflows_dir()
+            && let Some(id) = workflow_id(name)
+        {
+            self.load_workflow(id);
+            return true;
         }
         false
     }
@@ -210,14 +210,15 @@ impl Children {
                 ..Subagent::default()
             });
         let meta_modified = meta_md.as_ref().and_then(|m| m.modified().ok());
-        if meta_modified.is_some() && meta_modified != entry.meta_modified {
-            if let Some(meta) = read_json(&meta_path) {
-                entry.agent_type = meta["agentType"].as_str().unwrap_or("agent").to_string();
-                entry.description = meta["description"].as_str().unwrap_or_default().to_string();
-                entry.parent = meta["parentAgentId"].as_str().map(String::from);
-                entry.finished = meta["finished"] == true;
-                entry.meta_modified = meta_modified;
-            }
+        if meta_modified.is_some()
+            && meta_modified != entry.meta_modified
+            && let Some(meta) = read_json(&meta_path)
+        {
+            entry.agent_type = meta["agentType"].as_str().unwrap_or("agent").to_string();
+            entry.description = meta["description"].as_str().unwrap_or_default().to_string();
+            entry.parent = meta["parentAgentId"].as_str().map(String::from);
+            entry.finished = meta["finished"] == true;
+            entry.meta_modified = meta_modified;
         }
         let times = || meta_md.iter().chain(log_md.iter());
         entry.started = times().filter_map(|m| m.created().ok()).min();
@@ -305,7 +306,7 @@ impl Children {
                 ));
             }
         }
-        roots.sort_by(|a, b| a.0.cmp(&b.0));
+        roots.sort_by_key(|r| r.0);
         roots.into_iter().map(|(_, t)| t).collect()
     }
 

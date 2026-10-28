@@ -68,11 +68,11 @@ impl Watches {
             if owned || !dir.is_dir() {
                 continue;
             }
-            if !self.owners.contains_key(&dir) {
-                if let Err(e) = self.watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                    crate::log::warn(&format!("watch {}: {e}", dir.display()));
-                    continue;
-                }
+            if !self.owners.contains_key(&dir)
+                && let Err(e) = self.watcher.watch(&dir, RecursiveMode::NonRecursive)
+            {
+                crate::log::warn(&format!("watch {}: {e}", dir.display()));
+                continue;
             }
             self.owners
                 .entry(dir.clone())
@@ -100,6 +100,7 @@ impl Watches {
         }
     }
 
+    #[cfg(test)]
     pub fn watched(&self) -> impl Iterator<Item = &Path> {
         self.owners.keys().map(PathBuf::as_path)
     }

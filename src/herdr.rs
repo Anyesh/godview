@@ -98,10 +98,6 @@ impl Client {
         std::env::var_os("HERDR_SOCKET_PATH").map(Client::new)
     }
 
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
     fn connect(&self) -> Result<UnixStream> {
         let stream = UnixStream::connect(&self.socket)
             .with_context(|| format!("connect {}", self.socket.display()))?;
