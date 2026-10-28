@@ -68,6 +68,8 @@ pub struct AgentEntry {
     pub active: bool,
     pub rate: [u16; RATE_BUCKETS],
     pub tool_changed_at: Option<Instant>,
+    /// [`AgentEntry::wire_running`], kept by [`Model::update`] so frames need not walk the tree.
+    pub wired: bool,
     pub children: Vec<ChildEntry>,
 }
 
@@ -147,7 +149,8 @@ impl Model {
 
     pub fn update(&mut self, entries: Vec<AgentEntry>) {
         let mut groups: Vec<Group> = Vec::new();
-        for e in entries {
+        for mut e in entries {
+            e.wired = e.wire_running();
             match groups.iter_mut().find(|g| g.key == e.group_key) {
                 Some(g) => g.agents.push(e),
                 None => groups.push(Group {
@@ -428,6 +431,7 @@ pub mod tests {
             active_at: None,
             active: false,
             rate: [0; RATE_BUCKETS],
+            wired: false,
             tool_changed_at: None,
             children: Vec::new(),
         }

@@ -88,7 +88,6 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
     let mut last_draw = Instant::now();
     let mut ticks = Deadline::new();
     let mut frames = Deadline::new();
-    let mut was_animating = false;
     loop {
         let now = Instant::now();
         if ticks.due(now, app.tick_interval()) {
@@ -98,18 +97,17 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             ticks.fired(Instant::now());
             dirty = true;
         }
-        let animating = app.animating(now);
+        let animating = app.animating();
         if animating && frames.due(now, FRAME) {
             app.advance_frame();
             frames.fired(now);
             dirty = true;
             urgent = true;
-        } else if was_animating && !animating {
-            // The frame that clears the last flash or stops the spinners.
+        }
+        if fade_ended(last_draw, app.fade_until(), now) {
             dirty = true;
             urgent = true;
         }
-        was_animating = animating;
         if dirty && (urgent || now.duration_since(last_draw) >= DEBOUNCE) {
             terminal.draw(|f| ui::draw(f, &app.view(), &mut list))?;
             last_draw = Instant::now();
@@ -124,6 +122,7 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
             animating,
             dirty,
             last_draw,
+            app.fade_until(),
         );
         let first = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
@@ -144,8 +143,9 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, rx: &Receiver<Msg>) 
     }
 }
 
-/// How long to sleep before the next tick, frame or debounced draw. A frame deadline counts
-/// only while animating, so one left in the past by an idle spell cannot spin the loop.
+/// How long to sleep before the next tick, frame, debounced draw or fade end. A frame
+/// deadline counts only while animating and a fade end only while ahead, so one left in the
+/// past by an idle spell cannot spin the loop.
 fn next_wait(
     now: Instant,
     tick_at: Instant,
@@ -153,6 +153,7 @@ fn next_wait(
     animating: bool,
     dirty: bool,
     last_draw: Instant,
+    fade_until: Option<Instant>,
 ) -> Duration {
     let mut at = tick_at;
     if animating {
@@ -161,7 +162,15 @@ fn next_wait(
     if dirty {
         at = at.min(last_draw + DEBOUNCE);
     }
+    if let Some(fade) = fade_until.filter(|&t| t > now) {
+        at = at.min(fade);
+    }
     at.saturating_duration_since(now)
+}
+
+/// A flash or highlight ran out since the last draw, which still shows it.
+fn fade_ended(last_draw: Instant, fade_until: Option<Instant>, now: Instant) -> bool {
+    fade_until.is_some_and(|t| last_draw < t && t <= now)
 }
 
 /// A tick deadline that messages arriving in between do not push back. It keeps when it
@@ -222,22 +231,28 @@ mod tests {
     #[test]
     fn the_wait_ignores_a_stale_frame_deadline_when_nothing_animates() {
         let now = Instant::now() + ms(10_000);
-        let wait = next_wait(now, now + ms(1000), now - ms(5000), false, false, now);
+        let wait = next_wait(now, now + ms(1000), now - ms(5000), false, false, now, None);
         assert_eq!(wait, ms(1000));
     }
 
     #[test]
     fn the_wait_is_zero_only_when_something_is_due() {
         let now = Instant::now() + ms(10_000);
-        assert_eq!(next_wait(now, now, now + ms(50), true, false, now), ms(0));
-        assert_eq!(next_wait(now, now + ms(1000), now, true, false, now), ms(0));
+        assert_eq!(
+            next_wait(now, now, now + ms(50), true, false, now, None),
+            ms(0)
+        );
+        assert_eq!(
+            next_wait(now, now + ms(1000), now, true, false, now, None),
+            ms(0)
+        );
         let drew = now - ms(30);
         assert_eq!(
-            next_wait(now, now + ms(1000), now - ms(500), false, true, drew),
+            next_wait(now, now + ms(1000), now - ms(500), false, true, drew, None),
             ms(70)
         );
         assert_eq!(
-            next_wait(now, now + ms(1000), now + ms(50), false, false, drew),
+            next_wait(now, now + ms(1000), now + ms(50), false, false, drew, None),
             ms(1000)
         );
     }
@@ -248,8 +263,29 @@ mod tests {
         let mut frames = Deadline::new();
         frames.fired(now - ms(25));
         let frame_at = frames.next(FRAME, now);
-        let wait = next_wait(now, now + ms(30_000), frame_at, true, false, now);
+        let wait = next_wait(now, now + ms(30_000), frame_at, true, false, now, None);
         assert_eq!(wait, FRAME - ms(25));
+    }
+
+    #[test]
+    fn without_frames_a_fade_wakes_the_loop_once_at_its_end() {
+        let now = Instant::now() + ms(10_000);
+        let tick = now + ms(1000);
+        let stale = now - ms(5000);
+        let until = Some(now + ms(300));
+        assert_eq!(
+            next_wait(now, tick, stale, false, false, now, until),
+            ms(300)
+        );
+        let past = Some(now - ms(10));
+        assert_eq!(
+            next_wait(now, tick, stale, false, false, now, past),
+            ms(1000)
+        );
+        assert!(fade_ended(now - ms(50), past, now));
+        assert!(!fade_ended(now, past, now));
+        assert!(!fade_ended(now - ms(50), until, now));
+        assert!(!fade_ended(now - ms(50), None, now));
     }
 
     #[test]

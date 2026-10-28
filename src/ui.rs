@@ -208,7 +208,7 @@ fn row_text(row: &Row, width: usize, view: &View, spark: bool) -> Text<'static> 
             ordinal,
             period,
         } => {
-            let lit = ordinal.is_some() && entry.wire_running();
+            let lit = ordinal.is_some() && entry.wired;
             let wire = Wire {
                 lit,
                 pulse: lit
@@ -995,8 +995,9 @@ mod tests {
         let mut e = working();
         let at = Instant::now();
         e.tool_changed_at = Some(at);
+        e.children[0].tool_changed_at = Some(at);
         m.update(vec![e]);
-        let flashed = |instant| {
+        let flashed = |instant, needle: &str| {
             let term = draw_on(
                 140,
                 24,
@@ -1007,12 +1008,15 @@ mod tests {
             );
             let y = screen(&term)
                 .lines()
-                .position(|l| l.contains("cargo nextest"))
+                .position(|l| l.contains(needle))
                 .unwrap() as u16;
             term.backend().buffer()[(40, y)].bg == FLASH_BG
         };
-        assert!(flashed(at + Duration::from_millis(100)));
-        assert!(!flashed(at + FLASH));
+        for needle in ["cargo nextest", "c1 desc"] {
+            assert!(flashed(at + Duration::from_millis(100), needle), "{needle}");
+            assert!(!flashed(at + FLASH, needle), "{needle}");
+        }
+        assert!(!flashed(at, "review-changes"));
     }
 
     #[test]

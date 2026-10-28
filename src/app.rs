@@ -9,7 +9,7 @@ use crate::crew::Repos;
 use crate::feed::{Feed, FeedMsg};
 use crate::herdr::{Client, Snapshot, Status};
 use crate::live::{self, Key, StreamItem, Tracker};
-use crate::model::{self, AgentEntry, ChildEntry, ChildInfo, Model};
+use crate::model::{self, AgentEntry, ChildEntry, ChildInfo, Model, Row};
 use crate::profile::Profiles;
 use crate::transcript::{self, Activity, RATE_BUCKETS, Tail, ToolCall};
 use crate::ui::View;
@@ -85,8 +85,14 @@ impl App {
         }
     }
 
-    pub fn animating(&self, now: Instant) -> bool {
-        animating(now, self.motion, self.in_motion, self.tracker.fade_until())
+    /// Frames run only for motion on screen. A flash or highlight needs no frames, only the
+    /// draw at [`App::fade_until`] that clears it.
+    pub fn animating(&self) -> bool {
+        self.motion && self.in_motion
+    }
+
+    pub fn fade_until(&self) -> Option<Instant> {
+        self.tracker.fade_until()
     }
 
     pub fn advance_frame(&mut self) {
@@ -134,19 +140,13 @@ impl App {
         }
     }
 
-    /// Seconds-resolution ages only show for working agents and peeked output; a blocked
-    /// agent can sit on a prompt for hours and needs no 1 Hz redraw.
     pub fn tick_interval(&self) -> Duration {
-        let busy = self
+        let working = self
             .snapshot
             .agents
             .iter()
             .any(|a| a.status == Status::Working);
-        if busy || self.model.peek {
-            BUSY_TICK
-        } else {
-            IDLE_TICK
-        }
+        tick_for(working, self.model.peek, self.running_children)
     }
 
     /// Runs on every frame, so it only borrows what rebuilds computed.
@@ -288,6 +288,7 @@ impl App {
                     .as_ref()
                     .map_or([0; RATE_BUCKETS], |x| x.rate(epoch(now))),
                 tool_changed_at: None,
+                wired: false,
                 activity,
                 children,
             });
@@ -305,13 +306,13 @@ impl App {
             e.tool_changed_at = self.tracker.changed_at(&Key::Agent(pane.clone()));
             mark_changes(&self.tracker, &pane, &mut e.children);
         }
-        self.in_motion = in_motion(&entries);
         self.running_children = self
             .sessions
             .values()
             .map(|s| s.children.running(now))
             .sum();
         self.model.update(entries);
+        self.in_motion = in_motion(&self.model);
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Effect {
@@ -344,6 +345,8 @@ impl App {
             KeyCode::Enter => self.focus_selected(),
             _ => return Effect::None,
         }
+        // Folds and filters change what is on screen without a rebuild.
+        self.in_motion = in_motion(&self.model);
         Effect::Redraw
     }
 
@@ -486,14 +489,25 @@ fn mark_changes(tracker: &Tracker, pane: &str, children: &mut [ChildEntry]) {
     }
 }
 
-/// Something on screen moves: an active agent's spinner or a wire with work in flight.
-fn in_motion(entries: &[AgentEntry]) -> bool {
-    entries.iter().any(|e| e.active || e.wire_running())
+/// A visible row moves: an active agent's spinner, or a wire with work in flight. Agents
+/// folded, filtered or under "more done" draw nothing that moves.
+fn in_motion(model: &Model) -> bool {
+    model.rows().iter().any(|(_, row)| match row {
+        Row::Agent { entry } => entry.active,
+        Row::Child { entry, ordinal, .. } => ordinal.is_some() && entry.wired,
+        Row::Group { .. } | Row::More { .. } => false,
+    })
 }
 
-/// A fade runs to its end whatever the motion setting.
-fn animating(now: Instant, motion: bool, in_motion: bool, fade_until: Option<Instant>) -> bool {
-    fade_until.is_some_and(|t| now < t) || (motion && in_motion)
+/// Seconds-resolution ages show for working agents and peeked output, and a running child
+/// goes stale with the clock alone; a blocked agent can sit on a prompt for hours and needs
+/// no 1 Hz redraw.
+fn tick_for(working: bool, peek: bool, running_children: usize) -> Duration {
+    if working || peek || running_children > 0 {
+        BUSY_TICK
+    } else {
+        IDLE_TICK
+    }
 }
 
 fn epoch(t: SystemTime) -> i64 {
@@ -513,7 +527,6 @@ fn home_relative(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anim::FLASH;
     use crate::children::Liveness;
     use crate::model::tests::{agent, entry, subagent};
 
@@ -527,35 +540,49 @@ mod tests {
         e
     }
 
-    #[test]
-    fn blocked_or_stale_agents_do_not_animate() {
-        assert!(!in_motion(&[with(
-            Status::Blocked,
-            false,
-            Some(Liveness::Running)
-        )]));
-        assert!(!in_motion(&[with(Status::Working, false, None)]));
-        assert!(!in_motion(&[with(
-            Status::Working,
-            false,
-            Some(Liveness::Stale)
-        )]));
-        assert!(in_motion(&[with(Status::Working, true, None)]));
-        assert!(in_motion(&[with(
-            Status::Idle,
-            false,
-            Some(Liveness::Running)
-        )]));
+    fn motion_of(entries: Vec<AgentEntry>, change: impl FnOnce(&mut Model)) -> bool {
+        let mut m = Model::default();
+        m.update(entries);
+        change(&mut m);
+        in_motion(&m)
     }
 
     #[test]
-    fn a_fade_animates_until_it_ends_even_with_motion_off() {
-        let now = Instant::now();
-        let until = Some(now + FLASH);
-        assert!(animating(now, false, false, until));
-        assert!(!animating(now + FLASH, false, false, until));
-        assert!(!animating(now + FLASH, true, false, until));
-        assert!(animating(now + FLASH, true, true, until));
-        assert!(!animating(now, false, true, None));
+    fn blocked_or_stale_agents_do_not_animate() {
+        let alone = |e| motion_of(vec![e], |_| {});
+        assert!(!alone(with(
+            Status::Blocked,
+            false,
+            Some(Liveness::Running)
+        )));
+        assert!(!alone(with(Status::Working, false, None)));
+        assert!(!alone(with(Status::Working, false, Some(Liveness::Stale))));
+        assert!(alone(with(Status::Working, true, None)));
+        assert!(alone(with(Status::Idle, false, Some(Liveness::Running))));
+    }
+
+    #[test]
+    fn motion_off_screen_does_not_animate() {
+        let mut done: Vec<AgentEntry> = (0..4)
+            .map(|i| {
+                entry(
+                    "incr",
+                    agent(&format!("p{i}"), &format!("w{i}"), Status::Done, 10 - i),
+                )
+            })
+            .collect();
+        done[3].children = vec![subagent("c1", Liveness::Running, vec![])];
+        assert!(!motion_of(done, |_| {}));
+        let wire = with(Status::Idle, false, Some(Liveness::Running));
+        assert!(!motion_of(vec![wire.clone()], Model::toggle_fold));
+        assert!(!motion_of(vec![wire], |m| m.set_working_only(true)));
+    }
+
+    #[test]
+    fn running_children_keep_the_busy_tick() {
+        assert_eq!(tick_for(false, false, 0), IDLE_TICK);
+        assert_eq!(tick_for(false, false, 1), BUSY_TICK);
+        assert_eq!(tick_for(true, false, 0), BUSY_TICK);
+        assert_eq!(tick_for(false, true, 0), BUSY_TICK);
     }
 }
