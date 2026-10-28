@@ -1,16 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::children::{ChildKey, ChildTree, Children};
+use crate::children::{ChildKey, ChildTree, Children, Liveness};
 use crate::crew::Repos;
 use crate::feed::{Feed, FeedMsg};
 use crate::herdr::{Client, Snapshot, Status};
+use crate::live::{self, Key, StreamItem, Tracker};
 use crate::model::{self, AgentEntry, ChildEntry, ChildInfo, Model};
 use crate::profile::Profiles;
-use crate::transcript::{self, RATE_BUCKETS, Tail};
+use crate::transcript::{self, Activity, RATE_BUCKETS, Tail, ToolCall};
 use crate::ui::View;
 use crate::watch::{self, Change, Target, Watches};
 
@@ -53,6 +54,12 @@ pub struct App {
     watches: Watches,
     model: Model,
     peek: Option<(String, String)>,
+    tracker: Tracker,
+    stream: Vec<StreamItem>,
+    running_children: usize,
+    in_motion: bool,
+    motion: bool,
+    frame: u64,
 }
 
 impl App {
@@ -69,7 +76,21 @@ impl App {
             watches,
             model: Model::default(),
             peek: None,
+            tracker: Tracker::new(epoch(SystemTime::now())),
+            stream: Vec::new(),
+            running_children: 0,
+            in_motion: false,
+            motion: true,
+            frame: 0,
         }
+    }
+
+    pub fn animating(&self, now: Instant) -> bool {
+        animating(now, self.motion, self.in_motion, self.tracker.fade_until())
+    }
+
+    pub fn advance_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
     }
 
     pub fn handle(&mut self, msg: Msg) -> Effect {
@@ -128,22 +149,21 @@ impl App {
         }
     }
 
+    /// Runs on every frame, so it only borrows what rebuilds computed.
     pub fn view(&self) -> View<'_> {
-        let now = SystemTime::now();
         View {
             model: &self.model,
-            now: epoch(now),
+            now: epoch(SystemTime::now()),
             peek: self
                 .peek
                 .as_ref()
-                .filter(|(pane, _)| Some(pane.as_str()) == self.selected_pane())
-                .map(|(_, text)| text.as_str()),
+                .map(|(pane, text)| (pane.as_str(), text.as_str())),
             status: self.status.as_deref(),
-            running_children: self
-                .sessions
-                .values()
-                .map(|s| s.children.running(now))
-                .sum(),
+            running_children: self.running_children,
+            frame: self.frame,
+            instant: Instant::now(),
+            motion: self.motion,
+            stream: &self.stream,
         }
     }
 
@@ -272,6 +292,25 @@ impl App {
                 children,
             });
         }
+        let mut current = Vec::new();
+        let mut items = Vec::new();
+        for e in &entries {
+            collect_calls(e, &mut current, &mut items);
+        }
+        self.stream = self
+            .tracker
+            .update(&current, items, epoch(now), Instant::now());
+        for e in &mut entries {
+            let pane = e.agent.pane_id.clone();
+            e.tool_changed_at = self.tracker.changed_at(&Key::Agent(pane.clone()));
+            mark_changes(&self.tracker, &pane, &mut e.children);
+        }
+        self.in_motion = in_motion(&entries);
+        self.running_children = self
+            .sessions
+            .values()
+            .map(|s| s.children.running(now))
+            .sum();
         self.model.update(entries);
     }
 
@@ -291,6 +330,7 @@ impl App {
                 let on = !self.model.working_only();
                 self.model.set_working_only(on);
             }
+            KeyCode::Char('m') => self.motion = !self.motion,
             KeyCode::Char('a') => {
                 self.model.all_children = !self.model.all_children;
                 self.rebuild();
@@ -385,6 +425,77 @@ fn child_entries(children: &Children, tree: Vec<ChildTree>) -> Vec<ChildEntry> {
         .collect()
 }
 
+fn collect_calls<'a>(
+    e: &'a AgentEntry,
+    current: &mut Vec<(Key, Option<&'a ToolCall>)>,
+    items: &mut Vec<StreamItem>,
+) {
+    let who = &e.agent.label;
+    let activity = e.activity.as_ref();
+    current.push((
+        Key::Agent(e.agent.pane_id.clone()),
+        activity.and_then(Activity::current),
+    ));
+    // Newest first, so calls within one second keep their order in the stable sort.
+    let recent = activity.into_iter().flat_map(|a| a.recent.iter().rev());
+    items.extend(recent.filter_map(|c| live::call_item(who, None, c)));
+    collect_child_calls(e, &e.children, current, items);
+}
+
+fn collect_child_calls<'a>(
+    e: &AgentEntry,
+    children: &'a [ChildEntry],
+    current: &mut Vec<(Key, Option<&'a ToolCall>)>,
+    items: &mut Vec<StreamItem>,
+) {
+    let who = &e.agent.label;
+    for c in children {
+        let running = c.liveness == Liveness::Running;
+        match (&c.info, &c.key) {
+            (
+                ChildInfo::Subagent {
+                    agent_type,
+                    activity,
+                    ..
+                },
+                _,
+            ) => {
+                let key = Key::Child(e.agent.pane_id.clone(), c.key.clone());
+                current.push((key, activity.as_ref().and_then(Activity::current)));
+                if running {
+                    let recent = activity.iter().flat_map(|a| a.recent.iter().rev());
+                    items.extend(recent.filter_map(|t| live::call_item(who, Some(agent_type), t)));
+                }
+            }
+            (ChildInfo::Workflow { agents, .. }, ChildKey::Workflow(id)) if running => {
+                let in_flight = agents
+                    .iter()
+                    .filter(|a| matches!(a.state.as_str(), "start" | "progress"));
+                items.extend(in_flight.filter_map(|a| live::workflow_item(who, id, a)));
+            }
+            _ => {}
+        }
+        collect_child_calls(e, &c.children, current, items);
+    }
+}
+
+fn mark_changes(tracker: &Tracker, pane: &str, children: &mut [ChildEntry]) {
+    for c in children {
+        c.tool_changed_at = tracker.changed_at(&Key::Child(pane.to_string(), c.key.clone()));
+        mark_changes(tracker, pane, &mut c.children);
+    }
+}
+
+/// Something on screen moves: an active agent's spinner or a wire with work in flight.
+fn in_motion(entries: &[AgentEntry]) -> bool {
+    entries.iter().any(|e| e.active || e.wire_running())
+}
+
+/// A fade runs to its end whatever the motion setting.
+fn animating(now: Instant, motion: bool, in_motion: bool, fade_until: Option<Instant>) -> bool {
+    fade_until.is_some_and(|t| now < t) || (motion && in_motion)
+}
+
 fn epoch(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -396,5 +507,55 @@ fn home_relative(path: &str) -> String {
             format!("~{}", &path[home.len()..])
         }
         _ => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anim::FLASH;
+    use crate::children::Liveness;
+    use crate::model::tests::{agent, entry, subagent};
+
+    fn with(status: Status, active: bool, child: Option<Liveness>) -> AgentEntry {
+        let mut e = entry("incr", agent("p1", "w1", status, 1));
+        e.active = active;
+        e.children = child
+            .map(|l| subagent("c1", l, vec![]))
+            .into_iter()
+            .collect();
+        e
+    }
+
+    #[test]
+    fn blocked_or_stale_agents_do_not_animate() {
+        assert!(!in_motion(&[with(
+            Status::Blocked,
+            false,
+            Some(Liveness::Running)
+        )]));
+        assert!(!in_motion(&[with(Status::Working, false, None)]));
+        assert!(!in_motion(&[with(
+            Status::Working,
+            false,
+            Some(Liveness::Stale)
+        )]));
+        assert!(in_motion(&[with(Status::Working, true, None)]));
+        assert!(in_motion(&[with(
+            Status::Idle,
+            false,
+            Some(Liveness::Running)
+        )]));
+    }
+
+    #[test]
+    fn a_fade_animates_until_it_ends_even_with_motion_off() {
+        let now = Instant::now();
+        let until = Some(now + FLASH);
+        assert!(animating(now, false, false, until));
+        assert!(!animating(now + FLASH, false, false, until));
+        assert!(!animating(now + FLASH, true, false, until));
+        assert!(animating(now + FLASH, true, true, until));
+        assert!(!animating(now, false, true, None));
     }
 }

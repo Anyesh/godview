@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::children::Liveness;
 use crate::herdr::Status;
+use crate::live::StreamItem;
 use crate::model::{AgentEntry, ChildEntry, ChildInfo, Model, Row};
 use crate::transcript::Activity;
 
@@ -21,9 +24,14 @@ const SPLIT_MIN_WIDTH: u16 = 80;
 pub struct View<'a> {
     pub model: &'a Model,
     pub now: i64,
-    pub peek: Option<&'a str>,
+    /// The pane last read for peek, and its output.
+    pub peek: Option<(&'a str, &'a str)>,
     pub status: Option<&'a str>,
     pub running_children: usize,
+    pub frame: u64,
+    pub instant: Instant,
+    pub motion: bool,
+    pub stream: &'a [StreamItem],
 }
 
 pub fn draw(frame: &mut Frame, view: &View, list: &mut ListState) {
@@ -289,7 +297,9 @@ fn draw_detail(frame: &mut Frame, view: &View, area: Rect) {
     let block = Block::bordered().title(title);
     if view.model.peek {
         let height = area.height.saturating_sub(2) as usize;
-        let lines: Vec<&str> = view.peek.unwrap_or("").lines().collect();
+        let pane = selection.map(|(e, _)| e.agent.pane_id.as_str());
+        let text = view.peek.filter(|(p, _)| Some(*p) == pane).map(|(_, t)| t);
+        let lines: Vec<&str> = text.unwrap_or("").lines().collect();
         let shown = lines[lines.len().saturating_sub(height)..].join("\n");
         frame.render_widget(Paragraph::new(shown).block(block), area);
         return;
@@ -555,17 +565,39 @@ mod tests {
         e
     }
 
-    fn render(model: &Model, peek: Option<&str>) -> String {
-        let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
-        let mut list = ListState::default();
-        let view = View {
+    fn view(model: &Model) -> View<'_> {
+        View {
             model,
             now: NOW,
-            peek,
+            peek: None,
             status: None,
             running_children: 2,
-        };
-        term.draw(|f| draw(f, &view, &mut list)).unwrap();
+            frame: 0,
+            instant: Instant::now(),
+            motion: true,
+            stream: &[],
+        }
+    }
+
+    fn render(model: &Model, peek: Option<(&str, &str)>) -> String {
+        screen(&draw_on(
+            140,
+            24,
+            &View {
+                peek,
+                ..view(model)
+            },
+        ))
+    }
+
+    fn draw_on(width: u16, height: u16, view: &View) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, view, &mut ListState::default()))
+            .unwrap();
+        term
+    }
+
+    fn screen(term: &Terminal<TestBackend>) -> String {
         let buf = term.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -613,19 +645,11 @@ mod tests {
         let header = s.lines().next().unwrap();
         assert!(header.contains("2 agents · 1 working · 2 subagents running"));
         m.update(vec![working()]);
-        let mut term = Terminal::new(TestBackend::new(140, 5)).unwrap();
-        let view = View {
-            model: &m,
-            now: NOW,
-            peek: None,
-            status: None,
+        let one = View {
             running_children: 1,
+            ..view(&m)
         };
-        term.draw(|f| draw(f, &view, &mut ListState::default()))
-            .unwrap();
-        let top: String = (0..60)
-            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
-            .collect();
+        let top = screen(&draw_on(140, 5, &one));
         assert!(
             top.contains("1 agent · 1 working · 1 subagent running"),
             "{top}"
@@ -652,7 +676,7 @@ mod tests {
         let mut m = Model::default();
         m.update(vec![working()]);
         m.peek = true;
-        let s = render(&m, Some("$ cargo test\nrunning 3 tests\n"));
+        let s = render(&m, Some(("p1", "$ cargo test\nrunning 3 tests\n")));
         assert!(s.contains("running 3 tests"));
         assert!(!s.contains("recent tools"));
     }
