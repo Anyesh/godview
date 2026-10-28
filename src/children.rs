@@ -98,8 +98,9 @@ impl Workflow {
         ) {
             return Liveness::Done;
         }
+        let in_flight = self.running_agents() > 0;
         match age(self.modified, now) {
-            Some(age) if age <= PENDING_WINDOW => Liveness::Running,
+            Some(age) if age <= FRESH || (in_flight && age <= PENDING_WINDOW) => Liveness::Running,
             _ => Liveness::Stale,
         }
     }
@@ -613,6 +614,26 @@ mod tests {
         assert_eq!(w.running_agents(), 2);
         assert_eq!(w.liveness(now), Liveness::Running);
         assert_eq!(c.tree(now, false)[0].key, ChildKey::Workflow("wf_1".into()));
+    }
+
+    #[test]
+    fn a_quiet_workflow_runs_only_while_an_agent_is_in_flight() {
+        let f = Fixture::new();
+        let path = f.session.join("workflows/wf_3.json");
+        let write = |state: &str| {
+            let wf = json!({"status":"running","workflowName":"x","workflowProgress":[
+                {"type":"workflow_agent","label":"a","phaseIndex":1,"state":state}]});
+            fs::write(&path, wf.to_string()).unwrap();
+            set_mtime(&path, SystemTime::now() - Duration::from_secs(300));
+        };
+        let mut c = Children::new(f.session.clone());
+        let now = SystemTime::now();
+        write("done");
+        c.rescan(now);
+        assert_eq!(c.workflow("wf_3").unwrap().liveness(now), Liveness::Stale);
+        write("progress");
+        c.on_path(&path, now);
+        assert_eq!(c.workflow("wf_3").unwrap().liveness(now), Liveness::Running);
     }
 
     #[test]
