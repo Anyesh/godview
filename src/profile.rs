@@ -4,12 +4,20 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT: &str = "default";
 
+#[derive(Debug)]
+struct Cached {
+    session: Option<String>,
+    pid: u32,
+    profile: String,
+}
+
 /// Profile names per pane, read from the environ of the pane's foreground process group
-/// leader and cached until that process is gone.
+/// leader. An entry holds while that process lives and the pane keeps its session, since a
+/// shell caught in the foreground outlives every agent started in it later.
 #[derive(Debug)]
 pub struct Profiles {
     proc_root: PathBuf,
-    by_pane: HashMap<String, (u32, String)>,
+    by_pane: HashMap<String, Cached>,
 }
 
 impl Profiles {
@@ -21,19 +29,29 @@ impl Profiles {
     }
 
     /// `pgid` asks herdr for the pane's foreground process group, and runs only on a miss.
-    pub fn get(&mut self, pane_id: &str, pgid: impl FnOnce() -> Option<u32>) -> Option<&str> {
+    pub fn get(
+        &mut self,
+        pane_id: &str,
+        session: Option<&str>,
+        pgid: impl FnOnce() -> Option<u32>,
+    ) -> Option<&str> {
         let alive = |pid: u32| self.proc_root.join(pid.to_string()).exists();
-        if !self
+        let valid = self
             .by_pane
             .get(pane_id)
-            .is_some_and(|(pid, _)| alive(*pid))
-        {
+            .is_some_and(|c| c.session.as_deref() == session && alive(c.pid));
+        if !valid {
             self.by_pane.remove(pane_id);
             let pid = pgid()?;
             let profile = read_profile(&self.proc_root, pid)?;
-            self.by_pane.insert(pane_id.to_string(), (pid, profile));
+            let cached = Cached {
+                session: session.map(String::from),
+                pid,
+                profile,
+            };
+            self.by_pane.insert(pane_id.to_string(), cached);
         }
-        self.by_pane.get(pane_id).map(|(_, p)| p.as_str())
+        self.by_pane.get(pane_id).map(|c| c.profile.as_str())
     }
 
     pub fn retain(&mut self, live: impl Fn(&str) -> bool) {
@@ -85,7 +103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         proc_with(dir.path(), 42, &["HOME=/h", "CLAUDE_PROFILE=alpha", "X=1"]);
         let mut p = Profiles::new(dir.path());
-        assert_eq!(p.get("w:p1", || Some(42)), Some("alpha"));
+        assert_eq!(p.get("w:p1", None, || Some(42)), Some("alpha"));
     }
 
     #[test]
@@ -102,9 +120,20 @@ mod tests {
             ],
         );
         let mut p = Profiles::new(dir.path());
-        assert_eq!(p.get("a", || Some(5)), Some("delta"));
-        assert_eq!(p.get("b", || Some(6)), Some(DEFAULT));
-        assert_eq!(p.get("c", || Some(8)), Some("alpha"));
+        assert_eq!(p.get("a", None, || Some(5)), Some("delta"));
+        assert_eq!(p.get("b", None, || Some(6)), Some(DEFAULT));
+        assert_eq!(p.get("c", None, || Some(8)), Some("alpha"));
+    }
+
+    #[test]
+    fn a_new_session_in_the_pane_reads_again() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_with(dir.path(), 10, &["HOME=/h"]);
+        proc_with(dir.path(), 11, &["CLAUDE_PROFILE=alpha"]);
+        let mut p = Profiles::new(dir.path());
+        assert_eq!(p.get("w:p1", None, || Some(10)), Some(DEFAULT));
+        assert_eq!(p.get("w:p1", Some("s1"), || Some(11)), Some("alpha"));
+        assert_eq!(p.get("w:p1", Some("s1"), || None), Some("alpha"));
     }
 
     #[test]
@@ -112,7 +141,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         proc_with(dir.path(), 7, &["HOME=/h"]);
         let mut p = Profiles::new(dir.path());
-        assert_eq!(p.get("w:p1", || Some(7)), Some(DEFAULT));
+        assert_eq!(p.get("w:p1", None, || Some(7)), Some(DEFAULT));
     }
 
     #[test]
@@ -125,13 +154,13 @@ mod tests {
             calls.set(calls.get() + 1);
             Some(pid)
         };
-        p.get("w:p1", || lookup(42));
-        p.get("w:p1", || lookup(42));
+        p.get("w:p1", None, || lookup(42));
+        p.get("w:p1", None, || lookup(42));
         assert_eq!(calls.get(), 1);
 
         fs::remove_dir_all(dir.path().join("42")).unwrap();
         proc_with(dir.path(), 43, &["CLAUDE_PROFILE=beta"]);
-        assert_eq!(p.get("w:p1", || lookup(43)), Some("beta"));
+        assert_eq!(p.get("w:p1", None, || lookup(43)), Some("beta"));
         assert_eq!(calls.get(), 2);
     }
 
@@ -139,9 +168,9 @@ mod tests {
     fn an_unreadable_process_is_unknown_and_retried() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = Profiles::new(dir.path());
-        assert_eq!(p.get("w:p1", || Some(99)), None);
-        assert_eq!(p.get("w:p1", || None), None);
+        assert_eq!(p.get("w:p1", None, || Some(99)), None);
+        assert_eq!(p.get("w:p1", None, || None), None);
         proc_with(dir.path(), 99, &["CLAUDE_PROFILE=gamma"]);
-        assert_eq!(p.get("w:p1", || Some(99)), Some("gamma"));
+        assert_eq!(p.get("w:p1", None, || Some(99)), Some("gamma"));
     }
 }

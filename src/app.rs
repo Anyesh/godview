@@ -172,7 +172,7 @@ impl App {
         }
         for a in &snapshot.agents {
             let client = &self.client;
-            self.profiles.get(&a.pane_id, || {
+            self.profiles.get(&a.pane_id, a.session_id.as_deref(), || {
                 client.foreground_pgid(&a.pane_id).ok().flatten()
             });
         }
@@ -246,7 +246,10 @@ impl App {
             });
             entries.push(AgentEntry {
                 agent: a.clone(),
-                profile: self.profiles.get(&a.pane_id, || None).map(String::from),
+                profile: self
+                    .profiles
+                    .get(&a.pane_id, a.session_id.as_deref(), || None)
+                    .map(String::from),
                 group_key,
                 group_label,
                 crew,
