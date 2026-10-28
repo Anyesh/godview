@@ -55,8 +55,9 @@ fn header_line(view: &View, width: usize) -> Line<'static> {
     let left = vec![
         Span::styled(" godview", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "   {total} agents · {working} working · {} subagents running",
-            view.running_children
+            "   {} · {working} working · {} running",
+            count(total, "agent"),
+            count(view.running_children, "subagent")
         )),
     ];
     let toggle = |on: bool, text: &'static str| {
@@ -198,18 +199,16 @@ fn agent_text(e: &AgentEntry, width: usize, now: i64) -> Text<'static> {
         e.active_at.map(|t| Span::styled(fmt_age(now - t), dim))
     };
     let mut lines = vec![spread(width, fixed, Span::raw(title), age)];
-    if busy {
-        if let Some(tool) = e.activity.as_ref().and_then(Activity::current) {
-            let indent = Span::raw(" ".repeat(TITLE_COL));
-            let name = Span::styled(format!("{}  ", tool.name), Style::new().fg(Color::Magenta));
-            let age = tool.at.map(|t| Span::styled(fmt_age(now - t), dim));
-            lines.push(spread(
-                width,
-                vec![indent, name],
-                Span::raw(tool.summary.clone()),
-                age,
-            ));
-        }
+    if busy && let Some(tool) = e.activity.as_ref().and_then(Activity::current) {
+        let indent = Span::raw(" ".repeat(TITLE_COL));
+        let name = Span::styled(format!("{}  ", tool.name), Style::new().fg(Color::Magenta));
+        let age = tool.at.map(|t| Span::styled(fmt_age(now - t), dim));
+        lines.push(spread(
+            width,
+            vec![indent, name],
+            Span::raw(tool.summary.clone()),
+            age,
+        ));
     }
     Text::from(lines)
 }
@@ -295,9 +294,10 @@ fn draw_detail(frame: &mut Frame, view: &View, area: Rect) {
         frame.render_widget(Paragraph::new(shown).block(block), area);
         return;
     }
+    let width = area.width.saturating_sub(2) as usize;
     let lines = match selection {
-        Some((entry, None)) => agent_detail(entry, view.now),
-        Some((_, Some(child))) => child_detail(child, view.now),
+        Some((entry, None)) => agent_detail(entry, view.now, width),
+        Some((_, Some(child))) => child_detail(child, view.now, width),
         None => Vec::new(),
     };
     frame.render_widget(
@@ -312,7 +312,7 @@ fn bold(text: String) -> Line<'static> {
     Line::styled(text, Style::new().add_modifier(Modifier::BOLD))
 }
 
-fn agent_detail(e: &AgentEntry, now: i64) -> Vec<Line<'static>> {
+fn agent_detail(e: &AgentEntry, now: i64, width: usize) -> Vec<Line<'static>> {
     let a = &e.agent;
     let mut lines = vec![bold(a.title.clone())];
     let mut usage = Vec::new();
@@ -336,12 +336,13 @@ fn agent_detail(e: &AgentEntry, now: i64) -> Vec<Line<'static>> {
         Style::new().fg(Color::DarkGray),
     ));
     if let Some(activity) = &e.activity {
-        lines.extend(activity_lines(activity, now));
+        lines.extend(activity_lines(activity, now, width));
     }
     lines
 }
 
-fn activity_lines(activity: &Activity, now: i64) -> Vec<Line<'static>> {
+/// Tool lines are cut to `width`; only the last text wraps.
+fn activity_lines(activity: &Activity, now: i64, width: usize) -> Vec<Line<'static>> {
     let dim = Style::new().fg(Color::DarkGray);
     let mut lines = Vec::new();
     if !activity.recent.is_empty() {
@@ -349,11 +350,11 @@ fn activity_lines(activity: &Activity, now: i64) -> Vec<Line<'static>> {
         lines.push(bold("recent tools".into()));
         for t in &activity.recent {
             let age = t.at.map_or(String::new(), |at| fmt_age(now - at));
-            lines.push(Line::from(vec![
+            let fixed = vec![
                 Span::styled(format!(" {age:>4}  "), dim),
                 Span::styled(format!("{:<6} ", t.name), Style::new().fg(Color::Magenta)),
-                Span::raw(t.summary.clone()),
-            ]));
+            ];
+            lines.push(spread(width, fixed, Span::raw(t.summary.clone()), None));
         }
     }
     if let Some(text) = &activity.last_text {
@@ -364,7 +365,7 @@ fn activity_lines(activity: &Activity, now: i64) -> Vec<Line<'static>> {
     lines
 }
 
-fn child_detail(c: &ChildEntry, now: i64) -> Vec<Line<'static>> {
+fn child_detail(c: &ChildEntry, now: i64, width: usize) -> Vec<Line<'static>> {
     let state = match c.liveness {
         Liveness::Running => "running",
         Liveness::Done => "done",
@@ -381,7 +382,7 @@ fn child_detail(c: &ChildEntry, now: i64) -> Vec<Line<'static>> {
                 Line::raw(description.clone()),
             ];
             if let Some(a) = activity {
-                lines.extend(activity_lines(a, now));
+                lines.extend(activity_lines(a, now, width));
             }
             lines
         }
@@ -407,7 +408,8 @@ fn child_detail(c: &ChildEntry, now: i64) -> Vec<Line<'static>> {
                     (Some(t), None) => t.clone(),
                     _ => String::new(),
                 };
-                lines.push(Line::raw(format!(" {:<8} {}  {tool}", a.state, a.label)));
+                let line = format!(" {:<8} {}  {tool}", a.state, a.label);
+                lines.push(Line::raw(fit(&line, width)));
             }
             lines
         }
@@ -461,6 +463,14 @@ fn pad(s: &str, width: usize) -> String {
     let text = fit(s, width);
     let gap = width.saturating_sub(text.width());
     text + &" ".repeat(gap)
+}
+
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 pub fn fmt_age(secs: i64) -> String {
@@ -579,7 +589,7 @@ mod tests {
         m.update(vec![working(), done()]);
         let s = render(&m, None);
         assert!(line_with(&s, "▾ incr").contains("incr"));
-        let row = line_with(&s, "worker-1");
+        let row = line_with(&s, "◐ worker-1");
         assert!(row.contains('◐') && row.contains("alpha") && row.contains("31%"));
         assert!(row.contains("worker-1 title"));
         let tool = line_with(&s, "cargo nextest run -p sched");
@@ -601,6 +611,24 @@ mod tests {
         let s = render(&m, None);
         let header = s.lines().next().unwrap();
         assert!(header.contains("2 agents · 1 working · 2 subagents running"));
+        m.update(vec![working()]);
+        let mut term = Terminal::new(TestBackend::new(140, 5)).unwrap();
+        let view = View {
+            model: &m,
+            now: NOW,
+            peek: None,
+            status: None,
+            running_children: 1,
+        };
+        term.draw(|f| draw(f, &view, &mut ListState::default()))
+            .unwrap();
+        let top: String = (0..60)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            top.contains("1 agent · 1 working · 1 subagent running"),
+            "{top}"
+        );
         assert!(header.contains("w working only"));
         m.set_working_only(true);
         let s = render(&m, None);
@@ -611,7 +639,6 @@ mod tests {
     fn detail_panel_follows_the_selection() {
         let mut m = Model::default();
         m.update(vec![working(), done()]);
-        m.move_selection(1);
         let s = render(&m, None);
         assert!(line_with(&s, "context 31% (310k)").contains("cache hit 99.7%"));
         assert!(s.contains("recent tools"));
@@ -623,7 +650,6 @@ mod tests {
     fn peek_replaces_the_detail_with_pane_output() {
         let mut m = Model::default();
         m.update(vec![working()]);
-        m.move_selection(1);
         m.peek = true;
         let s = render(&m, Some("$ cargo test\nrunning 3 tests\n"));
         assert!(s.contains("running 3 tests"));

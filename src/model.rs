@@ -77,7 +77,6 @@ pub enum Row<'a> {
         last: bool,
     },
     More {
-        group: &'a Group,
         hidden: usize,
     },
 }
@@ -194,7 +193,7 @@ impl Model {
                 .count();
             let more = || {
                 let hidden = if expanded { 0 } else { done_total - DONE_SHOWN };
-                (NodeId::More(group.key.clone()), Row::More { group, hidden })
+                (NodeId::More(group.key.clone()), Row::More { hidden })
             };
             let mut done_seen = 0;
             for entry in visible {
@@ -259,7 +258,11 @@ impl Model {
         }
         let find = |id: &NodeId| rows.iter().position(|(r, _)| r == id);
         let found = match &self.selected {
-            None => Some(0),
+            None => Some(
+                rows.iter()
+                    .position(|(id, _)| matches!(id, NodeId::Agent(_)))
+                    .unwrap_or(0),
+            ),
             Some(id) => find(id).or_else(|| match id {
                 NodeId::Child(pane, _) => find(&NodeId::Agent(pane.clone())),
                 _ => None,
@@ -501,7 +504,6 @@ pub mod tests {
         e.children = vec![subagent("c1", Liveness::Running, vec![])];
         m.update(vec![e, entry("incr", agent("p2", "w2", Status::Idle, 1))]);
         assert_eq!(m.rows().len(), 4);
-        m.move_selection(1);
         m.toggle_fold();
         assert_eq!(
             ids(&m),
@@ -510,6 +512,14 @@ pub mod tests {
         m.move_selection(-1);
         m.toggle_fold();
         assert_eq!(ids(&m), vec![NodeId::Group("/work/incr".into())]);
+    }
+
+    #[test]
+    fn the_cursor_starts_on_the_first_agent() {
+        let mut m = Model::default();
+        m.update(vec![entry("incr", agent("p1", "w1", Status::Idle, 1))]);
+        assert_eq!(m.selected_index(), Some(1));
+        assert_eq!(m.selection().unwrap().0.agent.pane_id, "p1");
     }
 
     #[test]
