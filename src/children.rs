@@ -105,7 +105,7 @@ impl Workflow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChildKey {
     Subagent(String),
     Workflow(String),
