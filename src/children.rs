@@ -144,12 +144,12 @@ impl Children {
         self.workflows.get(id)
     }
 
-    pub fn subagents_dir(&self) -> PathBuf {
-        self.dir.join("subagents")
+    fn subagents_dir(&self) -> PathBuf {
+        child_dirs(&self.dir)[0].clone()
     }
 
-    pub fn workflows_dir(&self) -> PathBuf {
-        self.dir.join("workflows")
+    fn workflows_dir(&self) -> PathBuf {
+        child_dirs(&self.dir)[1].clone()
     }
 
     /// Reads every file under the session dir again. `true` when it holds any child.
@@ -352,6 +352,11 @@ impl Children {
 }
 
 const MAX_DEPTH: usize = 8;
+
+/// The dirs under `<sid>/` that hold children: subagents, then workflows.
+pub fn child_dirs(session_dir: &Path) -> [PathBuf; 2] {
+    [session_dir.join("subagents"), session_dir.join("workflows")]
+}
 
 fn file_names(dir: &Path) -> impl Iterator<Item = String> {
     fs::read_dir(dir)

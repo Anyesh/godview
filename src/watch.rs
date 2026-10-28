@@ -4,18 +4,32 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::children::child_dirs;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub path: PathBuf,
     pub created: bool,
 }
 
+/// What a changed path belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Transcript(String),
+    /// `<sid>/` or one of its child dirs appeared.
+    SessionDir(String),
+    /// A file in one of the session's child dirs.
+    Child(String),
+    Other,
+}
+
 /// The non-recursive inotify watches for each live session: its project dir (where the main
-/// transcript lives), `<sid>/`, and `<sid>/subagents/` and `<sid>/workflows/` once they exist.
+/// transcript lives), `<sid>/`, and the child dirs once they exist.
 pub struct Watches {
     watcher: RecommendedWatcher,
     owners: HashMap<PathBuf, HashSet<String>>,
     by_sid: HashMap<String, Vec<PathBuf>>,
+    transcripts: HashMap<String, PathBuf>,
 }
 
 impl std::fmt::Debug for Watches {
@@ -45,7 +59,26 @@ impl Watches {
             watcher,
             owners: HashMap::new(),
             by_sid: HashMap::new(),
+            transcripts: HashMap::new(),
         })
+    }
+
+    pub fn classify(&self, path: &Path) -> Target {
+        let parent = path.parent();
+        for (sid, transcript) in &self.transcripts {
+            if path == transcript {
+                return Target::Transcript(sid.clone());
+            }
+            let session = session_dir(transcript);
+            let child_dirs = child_dirs(&session);
+            if path == session || child_dirs.iter().any(|d| d == path) {
+                return Target::SessionDir(sid.clone());
+            }
+            if parent.is_some_and(|p| child_dirs.iter().any(|d| d == p)) {
+                return Target::Child(sid.clone());
+            }
+        }
+        Target::Other
     }
 
     /// Watches whichever of the session's dirs exist and are not watched yet. `true` when it
@@ -55,13 +88,12 @@ impl Watches {
         let Some(project) = transcript.parent() else {
             return false;
         };
+        self.transcripts
+            .insert(sid.to_string(), transcript.to_path_buf());
         let session = session_dir(transcript);
-        let dirs = [
-            (project.to_path_buf(), false),
-            (session.join("subagents"), true),
-            (session.join("workflows"), true),
-            (session, true),
-        ];
+        let dirs = std::iter::once((project.to_path_buf(), false))
+            .chain(child_dirs(&session).into_iter().map(|d| (d, true)))
+            .chain(std::iter::once((session, true)));
         let mut added_under_session = false;
         for (dir, under_session) in dirs {
             let owned = self.by_sid.get(sid).is_some_and(|v| v.contains(&dir));
@@ -85,6 +117,7 @@ impl Watches {
     }
 
     pub fn untrack(&mut self, sid: &str) {
+        self.transcripts.remove(sid);
         for dir in self.by_sid.remove(sid).unwrap_or_default() {
             let Some(owners) = self.owners.get_mut(&dir) else {
                 continue;
@@ -193,6 +226,31 @@ mod tests {
 
         w.untrack("s2");
         assert_eq!(sorted(&w), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn classifies_changes_by_the_session_that_owns_them() {
+        let (_d, project, mut w, _rx) = setup();
+        let t = project.join("s1.jsonl");
+        w.ensure("s1", &t);
+        let s1 = || "s1".to_string();
+        assert_eq!(w.classify(&t), Target::Transcript(s1()));
+        assert_eq!(w.classify(&project.join("s1")), Target::SessionDir(s1()));
+        assert_eq!(
+            w.classify(&project.join("s1/subagents")),
+            Target::SessionDir(s1())
+        );
+        assert_eq!(
+            w.classify(&project.join("s1/workflows/wf_1.json")),
+            Target::Child(s1())
+        );
+        assert_eq!(
+            w.classify(&project.join("s1/tool-results/x")),
+            Target::Other
+        );
+        assert_eq!(w.classify(&project.join("s9.jsonl")), Target::Other);
+        w.untrack("s1");
+        assert_eq!(w.classify(&t), Target::Other);
     }
 
     #[test]

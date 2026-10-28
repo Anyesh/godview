@@ -12,7 +12,7 @@ use crate::model::{AgentEntry, ChildEntry, ChildInfo, Model};
 use crate::profile::Profiles;
 use crate::transcript::{self, Tail};
 use crate::ui::View;
-use crate::watch::{self, Change, Watches};
+use crate::watch::{self, Change, Target, Watches};
 
 const PEEK_LINES: usize = 200;
 const BUSY_TICK: Duration = Duration::from_secs(1);
@@ -186,38 +186,33 @@ impl App {
     fn on_change(&mut self, change: &Change) -> bool {
         let path = &change.path;
         let now = SystemTime::now();
-        if let Some(session) = self.sessions.values_mut().find(|s| &s.transcript == path) {
-            read_tail(session);
-            return true;
-        }
-        let parent = path.parent();
-        let grandparent = parent.and_then(Path::parent);
-        let owner = self.sessions.iter_mut().find_map(|(sid, s)| {
-            let dir = watch::session_dir(&s.transcript);
-            let hit = path == &dir || parent == Some(&dir) || grandparent == Some(&dir);
-            hit.then_some((sid, s, dir))
-        });
-        if let Some((sid, session, dir)) = owner {
-            let is_dir = path == &dir
-                || (parent == Some(&dir)
-                    && matches!(
-                        path.file_name().and_then(|n| n.to_str()),
-                        Some("subagents" | "workflows")
-                    ));
-            if is_dir {
-                if self.watches.ensure(sid, &session.transcript) {
+        match self.watches.classify(path) {
+            Target::Transcript(sid) => self.sessions.get_mut(&sid).is_some_and(|s| {
+                read_tail(s);
+                true
+            }),
+            Target::SessionDir(sid) => {
+                let Some(session) = self.sessions.get_mut(&sid) else {
+                    return false;
+                };
+                if self.watches.ensure(&sid, &session.transcript) {
                     session.children.rescan(now);
                 }
-                return true;
+                true
             }
-            return session.children.on_path(path, now);
+            Target::Child(sid) => self
+                .sessions
+                .get_mut(&sid)
+                .is_some_and(|s| s.children.on_path(path, now)),
+            Target::Other => {
+                // A session file nobody shows yet: a pane just started or /clear-ed into it,
+                // and herdr raises no event for that.
+                if change.created && path.extension().is_some_and(|e| e == "jsonl") {
+                    self.feed.refresh();
+                }
+                false
+            }
         }
-        // A session file nobody shows yet: a pane just started or /clear-ed into it, and
-        // herdr raises no event for that.
-        if change.created && path.extension().is_some_and(|e| e == "jsonl") {
-            self.feed.refresh();
-        }
-        false
     }
 
     fn rebuild(&mut self) {
